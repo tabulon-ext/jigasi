@@ -19,10 +19,12 @@ package org.jitsi.jigasi.transcription;
 
 import net.java.sip.communicator.impl.protocol.jabber.*;
 import net.java.sip.communicator.service.protocol.*;
+import org.jitsi.jigasi.*;
 import org.jitsi.jigasi.util.Util;
 import org.jitsi.xmpp.extensions.jitsimeet.*;
-import org.jitsi.utils.logging.*;
+import org.jitsi.utils.logging2.*;
 import org.jivesoftware.smack.packet.*;
+import org.jitsi.jigasi.stats.*;
 
 import javax.media.format.*;
 import java.nio.*;
@@ -32,7 +34,7 @@ import java.util.concurrent.*;
 /**
  * This class describes a participant in a conference whose
  * transcription is required. It manages the transcription if its own audio
- * will locally buffered until enough audio is collected
+ * locally buffers until enough audio is collected
  *
  * @author Nik Vaessen
  * @author Boris Grozev
@@ -43,7 +45,7 @@ public class Participant
     /**
      * The logger of this class
      */
-    private final static Logger logger = Logger.getLogger(Participant.class);
+    private final Logger logger;
 
     /**
      * The expected amount of bytes each given buffer will have. Webrtc
@@ -98,7 +100,7 @@ public class Participant
     /**
      * The {@link Transcriber} which owns this {@link Participant}.
      */
-    private Transcriber transcriber;
+    private final Transcriber transcriber;
 
     /**
      * The chat room participant.
@@ -113,12 +115,12 @@ public class Participant
     /**
      * The streaming session which will constantly receive audio
      */
-    private TranscriptionService.StreamingRecognitionSession session;
+    private HashMap<String, TranscriptionService.StreamingRecognitionSession> sessions = new HashMap<>();
 
     /**
      * A buffer which is used to locally store audio before sending
      */
-    private ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
+    private final ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
 
     /**
      * The AudioFormat of the audio being read. It is assumed to not change
@@ -152,16 +154,9 @@ public class Participant
      */
     private SilenceFilter silenceFilter = null;
 
-    /**
-     * Create a participant with a given name and audio stream
-     *
-     * @param transcriber the transcriber which created this participant
-     * @param identifier the string which is used to identify this participant
-     */
-    Participant(Transcriber transcriber, String identifier)
-    {
-        this(transcriber, identifier, false);
-    }
+    private String transcriptionServiceName;
+
+    private CallContext context;
 
     /**
      * Create a participant with a given name and audio stream
@@ -172,7 +167,10 @@ public class Participant
     Participant(Transcriber transcriber, String identifier, boolean filterAudio)
     {
         this.transcriber = transcriber;
+        this.context = transcriber.getCallContext();
+        this.logger = context.getLogger().createChildLogger(Participant.class.getName());
         this.identifier = identifier;
+        this.transcriptionServiceName = transcriber.getTranscriptionService().getClass().getSimpleName();
 
         if (filterAudio)
         {
@@ -187,7 +185,8 @@ public class Participant
      * @return a {@code String} or {@code null} if this instance has not been
      * initialized enough to get a proper debug name(not joined any room yet).
      */
-    String getDebugName() {
+    String getDebugName()
+    {
         ChatRoomMember _chatMember = this.chatMember;
 
         if (_chatMember == null)
@@ -341,6 +340,21 @@ public class Participant
     }
 
     /**
+     * Get the key to access the transcription session when language
+     * routing is supported
+     *
+     * @return the key of the Hashmap
+     */
+    public String getLanguageKey()
+    {
+        if (transcriber.getTranscriptionService().supportsLanguageRouting())
+        {
+            return this.getSourceLanguage();
+        }
+        return "global";
+    }
+
+    /**
      * Get the group id in the identity presence, if present
      *
      * @return the group id or null
@@ -370,8 +384,7 @@ public class Participant
      */
     private IdentityPacketExtension getIdentityExtensionOrNull(Presence p)
     {
-        return p.getExtension(IdentityPacketExtension.ELEMENT_NAME,
-            IdentityPacketExtension.NAME_SPACE);
+        return p.getExtension(IdentityPacketExtension.class);
     }
 
     /**
@@ -383,16 +396,14 @@ public class Participant
      */
     private AvatarIdPacketExtension getAvatarIdExtensionOrNull(Presence p)
     {
-        return p.getExtension(AvatarIdPacketExtension.ELEMENT_NAME,
-            AvatarIdPacketExtension.NAME_SPACE);
+        return p.getExtension(AvatarIdPacketExtension.class);
     }
 
     private TranscriptionRequestExtension
                 getTranscriptionRequestExtensionOrNull(Presence p)
     {
         return p != null
-                ? p.getExtension(TranscriptionRequestExtension.ELEMENT_NAME,
-                              TranscriptionRequestExtension.NAMESPACE)
+                ? p.getExtension(TranscriptionRequestExtension.class)
                 : null;
     }
 
@@ -471,16 +482,6 @@ public class Participant
     }
 
     /**
-     * Get the {@link ConferenceMember} belonging to this participant
-     *
-     * @return the conference member
-     */
-    public ConferenceMember getConfMember()
-    {
-        return confMember;
-    }
-
-    /**
      * Set the {@link ChatRoomMember} belonging to this participant
      *
      * @param chatMember the chatroom member
@@ -488,16 +489,6 @@ public class Participant
     public void setChatMember(ChatRoomMember chatMember)
     {
         this.chatMember = chatMember;
-    }
-
-    /**
-     * Get the {@link ChatRoomMember} belonging to this participant
-     *
-     * @return the chatroom member
-     */
-    public ChatRoomMember getChatMember()
-    {
-        return chatMember;
     }
 
     /**
@@ -516,6 +507,9 @@ public class Participant
      */
     void joined()
     {
+        TranscriptionService.StreamingRecognitionSession
+                session = sessions.getOrDefault(getLanguageKey(), null);
+
         if (session != null && !session.ended())
         {
             return; // no need to create new session
@@ -526,6 +520,7 @@ public class Participant
             session = transcriber.getTranscriptionService()
                 .initStreamingSession(this);
             session.addTranscriptionListener(this);
+            sessions.put(getLanguageKey(), session);
             isCompleted = false;
         }
     }
@@ -536,6 +531,7 @@ public class Participant
      */
     public void left()
     {
+        TranscriptionService.StreamingRecognitionSession session = sessions.getOrDefault(getLanguageKey(), null);
         if (session != null)
         {
             session.end();
@@ -594,7 +590,7 @@ public class Participant
     public void failed(FailureReason reason)
     {
         isCompleted = true;
-        logger.error(getDebugName() + " transcription failed: " + reason);
+        logger.error("transcription failed: " + reason);
         transcriber.stop(reason);
     }
 
@@ -663,6 +659,35 @@ public class Participant
            });
     }
 
+    private void incrementSentStats(int byteCount)
+    {
+        int divider = EXPECTED_AUDIO_LENGTH;
+
+        if (transcriptionServiceName.equals("WhisperTranscriptionService")
+                || transcriptionServiceName.equals("OracleTranscriptionService"))
+        {
+            // the byte count for each 20ms packet if the audio format is 16kHz mono
+            divider = 640;
+        }
+
+        long millis = byteCount / divider * 20;
+
+        switch (transcriptionServiceName) {
+            case "WhisperTranscriptionService":
+                Statistics.incrementTotalTranscriberWhisperMillis(millis);
+                break;
+            case "OracleTranscriptionService":
+                Statistics.incrementTotalTranscriberOracleMillis(millis);
+                break;
+            case "VoskTranscriptionService":
+                Statistics.incrementTotalTranscriberVoskMillis(millis);
+                break;
+            case "GoogleCloudTranscriptionService":
+                Statistics.incrementTotalTranscriberGoogleMillis(millis);
+                break;
+        }
+    }
+
     /**
      * Send the specified audio to the TranscriptionService.
      * <p>
@@ -674,6 +699,7 @@ public class Participant
     {
         transcriber.executorService.execute(() ->
         {
+            TranscriptionService.StreamingRecognitionSession session = sessions.getOrDefault(getLanguageKey(), null);
             TranscriptionRequest request
                 = new TranscriptionRequest(audio,
                                            audioFormat,
@@ -682,10 +708,18 @@ public class Participant
             if (session != null && !session.ended())
             {
                 session.sendRequest(request);
+                incrementSentStats(audio.length);
+            }
+            else if (transcriber.getTranscriptionService().supportsStreamRecognition())
+            // re-establish prematurely ended streaming session
+            {
+                session = transcriber.getTranscriptionService()
+                        .initStreamingSession(this);
+                session.addTranscriptionListener(this);
+                sessions.put(getLanguageKey(), session);
             }
             else
             // fallback if TranscriptionService does not support streams
-            // or session got ended prematurely
             {
                 // FIXME: 22/07/17 This just assumes given BUFFER_LENGTH
                 // is long enough to get decent audio length. Also does
@@ -698,6 +732,7 @@ public class Participant
                 transcriber.getTranscriptionService().sendSingleRequest(
                         request,
                         this::notify);
+                incrementSentStats(audio.length);
             }
         });
     }
@@ -759,5 +794,23 @@ public class Participant
                 memberJabber != null ? memberJabber.getLastPresence() : null);
 
         return ext != null && Boolean.parseBoolean(ext.getText());
+    }
+
+    public void flushBuffer()
+    {
+        transcriber.executorService.execute(() -> {
+            sendRequest(buffer.array());
+            ((Buffer) buffer).clear();
+        });
+    }
+
+    /**
+     * Retrieves the current call context.
+     *
+     * @return the current CallContext instance associated with this object
+     */
+    public CallContext getCallContext()
+    {
+        return this.context;
     }
 }

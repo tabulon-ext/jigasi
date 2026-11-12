@@ -17,8 +17,12 @@
  */
 package org.jitsi.jigasi;
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import net.java.sip.communicator.service.protocol.*;
-import net.java.sip.communicator.util.*;
+
+import org.jitsi.utils.*;
+import org.jitsi.utils.logging.Logger;
 import org.jxmpp.jid.*;
 import org.osgi.framework.*;
 
@@ -55,6 +59,12 @@ public abstract class AbstractGateway<T extends AbstractGatewaySession>
         = "org.jitsi.jigasi.JVB_INVITE_TIMEOUT";
 
     /**
+     * Name of the property used to set default empty call leave timeout.
+     */
+    public static final String P_NAME_DEFAULT_CALL_EMPTY_TIMEOUT
+        = "org.jitsi.jigasi.DEFAULT_CALL_EMPTY_TIMEOUT";
+
+    /**
      * Name of the property used to disable advertisement of ICE feature in
      * XMPP capabilities list. This allows conference manager to allocate
      * channels with RAW transport and speed up connectivity process.
@@ -66,6 +76,11 @@ public abstract class AbstractGateway<T extends AbstractGatewaySession>
      * Default JVB conference invite timeout.
      */
     public static final long DEFAULT_JVB_INVITE_TIMEOUT = 30L * 1000L;
+
+    /**
+     * Default empty call leave timeout.
+     */
+    public static final long DEFAULT_CALL_EMPTY_TIMEOUT = 30L * 1000L;
 
     /**
      * A map which matches CallContext to the specific session of a Gateway.
@@ -104,12 +119,40 @@ public abstract class AbstractGateway<T extends AbstractGatewaySession>
     public abstract boolean isReady();
 
     /**
+     * @return an <tt>ObjectNode</tt> instance that holds debug
+     * information for this instance.
+     */
+    public ObjectNode getDebugState()
+    {
+        ObjectNode debugState = JsonNodeFactory.instance.objectNode();
+        ObjectNode sessionsJson = JsonNodeFactory.instance.objectNode();
+        debugState.set("sessions", sessionsJson);
+        synchronized (sessions)
+        {
+            sessions.forEach((callContext, session) -> {
+                String displayName = session.getMucDisplayName();
+                if (displayName == null || displayName.trim() == "")
+                {
+                    displayName = Integer.toString(session.hashCode());
+                }
+                sessionsJson.set(displayName, session.getDebugState());
+            });
+        }
+
+        return debugState;
+    }
+
+    /**
      * Notified that current call has ended.
      *
      * @param callContext the context of the call ended.
      */
     void notifyCallEnded(CallContext callContext)
     {
+        // no-op if the setup span already ended (i.e. the call was
+        // established and this is a normal teardown)
+        callContext.failSetupSpan("call ended during setup");
+
         T session;
 
         synchronized (sessions)
@@ -162,6 +205,10 @@ public abstract class AbstractGateway<T extends AbstractGatewaySession>
     public void onLobbyWaitReview(ChatRoom lobbyRoom)
     {}
 
+    @Override
+    public void notifyConferenceLive(boolean v)
+    {}
+
     /**
      * Finds {@link AbstractGatewaySession} for given <tt>callResource</tt> if
      * one is currently active.
@@ -206,6 +253,15 @@ public abstract class AbstractGateway<T extends AbstractGatewaySession>
         return JigasiBundleActivator.getConfigurationService()
                                     .getLong(P_NAME_JVB_INVITE_TIMEOUT,
                                              DEFAULT_JVB_INVITE_TIMEOUT);
+    }
+
+    /**
+     * Returns timeout for waiting for the JVB conference invite from the focus.
+     */
+    public static long getEmptyCallTimeout()
+    {
+        return JigasiBundleActivator.getConfigurationService()
+            .getLong(P_NAME_DEFAULT_CALL_EMPTY_TIMEOUT, DEFAULT_CALL_EMPTY_TIMEOUT);
     }
 
     /**

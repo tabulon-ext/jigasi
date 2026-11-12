@@ -18,7 +18,8 @@
 package org.jitsi.jigasi.transcription;
 
 import net.java.sip.communicator.service.protocol.*;
-import org.json.*;
+import org.jitsi.jigasi.*;
+import org.json.simple.*;
 
 import java.time.*;
 import java.util.*;
@@ -225,19 +226,15 @@ public class LocalJsonTranscriptHandler
     }
 
     @Override
-    public void publish(ChatRoom room, TranscriptionResult result)
+    public void publish(JvbConference jvbConference, TranscriptionResult result)
     {
-        JSONObject eventObject = createTranscriptionJSONObject(result);
-
-        super.sendJsonMessage(room, eventObject);
+        jvbConference.sendJsonMessage(createTranscriptionJSONObject(result));
     }
 
     @Override
-    public void publish(ChatRoom room, TranslationResult result)
+    public void publish(JvbConference jvbConference, TranslationResult result)
     {
-        JSONObject eventObject = createTranslationJSONObject(result);
-
-        super.sendJsonMessage(room, eventObject);
+        jvbConference.sendJsonMessage(createTranslationJSONObject(result));
     }
 
     /**
@@ -250,7 +247,7 @@ public class LocalJsonTranscriptHandler
         TranscriptionResult result)
     {
         JSONObject eventObject = new JSONObject();
-        SpeechEvent event = new SpeechEvent(Instant.now(), result);
+        SpeechEvent event = new SpeechEvent(result);
 
         addEventDescriptions(eventObject, event);
         addAlternatives(eventObject, event);
@@ -271,8 +268,7 @@ public class LocalJsonTranscriptHandler
         TranslationResult result)
     {
         JSONObject eventObject = new JSONObject();
-        SpeechEvent event = new SpeechEvent(Instant.now(),
-            result.getTranscriptionResult());
+        SpeechEvent event = new SpeechEvent(result.getTranscriptionResult());
 
         addEventDescriptions(eventObject, event);
 
@@ -336,7 +332,7 @@ public class LocalJsonTranscriptHandler
         JSONObject jsonObject, TranscriptEvent e)
     {
         jsonObject.put(JSON_KEY_EVENT_EVENT_TYPE, e.getEvent().toString());
-        jsonObject.put(JSON_KEY_EVENT_TIMESTAMP, e.getTimeStamp().toString());
+        jsonObject.put(JSON_KEY_EVENT_TIMESTAMP, e.getTimeStamp().toEpochMilli());
 
         JSONObject participantJson = new JSONObject();
 
@@ -370,7 +366,7 @@ public class LocalJsonTranscriptHandler
             alternativeJSON.put(JSON_KEY_ALTERNATIVE_CONFIDENCE,
                 alternative.getConfidence());
 
-            alternativeJSONArray.put(alternativeJSON);
+            alternativeJSONArray.add(alternativeJSON);
         }
 
         jsonObject.put(JSON_KEY_EVENT_TRANSCRIPT, alternativeJSONArray);
@@ -477,7 +473,7 @@ public class LocalJsonTranscriptHandler
 
                 addParticipantDescription(pJSON, participant);
 
-                participantArray.put(pJSON);
+                participantArray.add(pJSON);
             }
 
             jsonObject.put(JSON_KEY_FINAL_TRANSCRIPT_INITIAL_PARTICIPANTS,
@@ -487,7 +483,7 @@ public class LocalJsonTranscriptHandler
         {
             JSONArray eventArray = new JSONArray();
 
-            events.forEach(eventArray::put);
+            eventArray.addAll(events);
 
             jsonObject.put(JSON_KEY_FINAL_TRANSCRIPT_EVENTS, eventArray);
         }

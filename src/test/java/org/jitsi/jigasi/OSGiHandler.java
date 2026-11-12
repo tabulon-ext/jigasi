@@ -17,14 +17,13 @@
  */
 package org.jitsi.jigasi;
 
+import java.util.*;
 import net.java.sip.communicator.service.protocol.*;
 import net.java.sip.communicator.service.protocol.mock.*;
-import net.java.sip.communicator.util.*;
+import net.java.sip.communicator.util.osgi.*;
 import org.jitsi.jigasi.osgi.*;
-import org.jitsi.meet.*;
 import org.osgi.framework.*;
-
-import java.util.*;
+import org.osgi.framework.launch.*;
 
 /**
  * Helper class takes encapsulates OSGi specifics operations.
@@ -33,19 +32,10 @@ import java.util.*;
  */
 public class OSGiHandler
 {
-    /**
-     * OSGi bundle context instance.
-     */
-    public BundleContext bc;
+    private BundleContext bc;
 
-    private BundleActivator bundleActivator;
-
-    private final Object syncRoot = new Object();
-
-    private MockProtocolProvider sipProvider;
-
-    public void init()
-        throws InterruptedException
+    public Framework init()
+        throws InterruptedException, BundleException
     {
         System.setProperty(
             "net.java.sip.communicator.impl.configuration.USE_PROPFILE_CONFIG",
@@ -58,79 +48,84 @@ public class OSGiHandler
             "false"
         );
 
-        this.bundleActivator = new BundleActivator()
+        JigasiBundleConfig.setSystemPropertyDefaults();
+        var fw = Main.start(List.of(
+            MockSipActivator.class,
+            MockProtocolProviderFactoriesActivator.class));
+        bc = fw.getBundleContext();
+        return fw;
+    }
+
+    public static class MockSipActivator
+        extends DependentActivator
+    {
+        public MockSipActivator()
         {
-            @Override
-            public void start(BundleContext bundleContext)
-                throws Exception
-            {
-                bc = bundleContext;
-                synchronized (syncRoot)
-                {
-                    syncRoot.notify();
-                }
-            }
-
-            @Override
-            public void stop(BundleContext bundleContext)
-                throws Exception
-            {
-
-            }
-        };
-
-        JigasiBundleConfig bundles = new JigasiBundleConfig();
-
-        JigasiBundleConfig.setUseMockProtocols(true);
-
-        OSGi.setBundleConfig(bundles);
-
-        bundles.setSystemPropertyDefaults();
-
-        OSGi.setClassLoader(ClassLoader.getSystemClassLoader());
-
-        OSGi.start(bundleActivator);
-
-        if (bc == null)
-        {
-            synchronized (syncRoot)
-            {
-                syncRoot.wait(5000);
-            }
+            super(ProtocolProviderFactory.class);
         }
 
-        if (bc == null)
-            throw new RuntimeException("Failed to start OSGI");
+        @Override
+        public void startWithServices(BundleContext context)
+        {
+            Map<String, String> accProps = new HashMap<>();
+            accProps.put(CallContext.DOMAIN_BASE_ACCOUNT_PROP, "sipserver.net");
+            MockAccountID mockSipAccount
+                = new MockAccountID("sipuser@sipserver.net",
+                accProps,
+                ProtocolNames.SIP);
 
-        createMockSipProvider();
+            var sipProvider = new MockProtocolProvider(mockSipAccount);
+            sipProvider.includeBasicTeleOpSet();
+            sipProvider.includeJitsiMeetToolsSip();
+
+            var properties = new Hashtable<String, String>();
+            properties.put(ProtocolProviderFactory.PROTOCOL, ProtocolNames.SIP);
+            properties.put(ProtocolProviderFactory.USER_ID,
+                "sipuser@sipserver.net");
+            context.registerService(ProtocolProviderService.class, sipProvider,
+                properties);
+        }
+
+        @Override
+        public void stop(BundleContext context)
+        {
+        }
     }
 
-    public void shutdown()
+    public MockProtocolProvider getSipProvider() throws InvalidSyntaxException
     {
-        OSGi.stop(bundleActivator);
-    }
+        var filter =
+            "(&(" + ProtocolProviderFactory.PROTOCOL + "=" + ProtocolNames.SIP
+                + ")"
+                + "(" + ProtocolProviderFactory.USER_ID
+                + "=sipuser@sipserver.net))";
+        // MockSipActivator is a DependentActivator, so the provider is registered asynchronously and may not be
+        // available the moment the framework becomes active. Wait for it instead of failing on the first miss.
+        var deadline = System.currentTimeMillis() + 5000;
+        do
+        {
+            var ref = bc.getServiceReferences(ProtocolProviderService.class, filter)
+                .stream()
+                .findFirst()
+                .orElse(null);
+            if (ref != null)
+            {
+                return (MockProtocolProvider) bc.getService(ref);
+            }
 
-    private void createMockSipProvider()
-    {
-        Map accProps = new HashMap<String, String>();
-        accProps.put(CallContext.DOMAIN_BASE_ACCOUNT_PROP, "sipserver.net");
-        MockAccountID mockSipAccount
-            = new MockAccountID("sipuser@sipserver.net",
-                                accProps,
-                                ProtocolNames.SIP);
+            try
+            {
+                Thread.sleep(50);
+            }
+            catch (InterruptedException e)
+            {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        while (System.currentTimeMillis() < deadline);
 
-        sipProvider
-            = new MockProtocolProvider(mockSipAccount);
-
-        sipProvider.includeBasicTeleOpSet();
-        sipProvider.includeJitsiMeetTools();
-
-        bc.registerService(ProtocolProviderService.class, sipProvider, null);
-    }
-
-    public MockProtocolProvider getSipProvider()
-    {
-        return sipProvider;
+        throw new NoSuchElementException("SIP provider was not registered");
     }
 
     public SipGateway getSipGateway()

@@ -20,7 +20,8 @@ package org.jitsi.jigasi.transcription;
 import org.eclipse.jetty.websocket.api.*;
 import org.eclipse.jetty.websocket.api.annotations.*;
 import org.eclipse.jetty.websocket.client.*;
-import org.json.*;
+import org.json.simple.*;
+import org.json.simple.parser.*;
 import org.jitsi.jigasi.*;
 import org.jitsi.utils.logging.*;
 
@@ -28,6 +29,7 @@ import javax.media.format.*;
 import java.io.*;
 import java.net.*;
 import java.nio.*;
+import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.function.*;
@@ -45,7 +47,7 @@ import java.util.function.*;
  * @author Nickolay V. Shmyrev
  */
 public class VoskTranscriptionService
-    implements TranscriptionService
+        extends AbstractTranscriptionService
 {
 
     /**
@@ -55,7 +57,7 @@ public class VoskTranscriptionService
             = Logger.getLogger(VoskTranscriptionService.class);
 
     /**
-     * The URL of the websocket service speech-to-text service.
+     * The config key of the websocket to the speech-to-text service.
      */
     public final static String WEBSOCKET_URL
             = "org.jitsi.jigasi.transcription.vosk.websocket_url";
@@ -64,15 +66,70 @@ public class VoskTranscriptionService
 
     private final static String EOF_MESSAGE = "{\"eof\" : 1}";
 
-    private final String websocketUrl;
+    /**
+     * The config value of the websocket to the speech-to-text service.
+     */
+    private String websocketUrlConfig;
 
     /**
-     * Create a TranscriptionService which will send audio to the google cloud
+     * The URL of the websocket to the speech-to-text service.
+     */
+    private String websocketUrl;
+
+    /**
+     * A parser for the JSON replies from the Vosk server.
+     *
+     * <p>{@link JSONParser} is not thread-safe: it keeps mutable state
+     * ({@code Yylex lexer}, {@code status}, {@code handlerStatusStack}) in
+     * instance fields and mutates it during {@code parse()}. There is one
+     * {@link VoskTranscriptionService} but one
+     * {@link VoskWebsocketStreamingSession} per participant, and their
+     * {@code @OnWebSocketMessage} callbacks are dispatched concurrently on
+     * Jetty pool threads, so a single shared parser lets one participant's
+     * message corrupt another's parse.
+     *
+     * <p>Reusing a thread-confined parser is preferred over allocating one per
+     * message because {@code new JSONParser()} eagerly builds a {@code Yylex}
+     * holding a 16384-char buffer, and Vosk emits partial results several
+     * times a second per participant. {@code parse()} calls {@code reset()} on
+     * entry, so reuse on a confined thread is safe.
+     */
+    private final ThreadLocal<JSONParser> jsonParser
+            = ThreadLocal.withInitial(JSONParser::new);
+
+    /**
+     * Assigns the websocketUrl to use to websocketUrl by reading websocketUrlConfig;
+     */
+    private void generateWebsocketUrl(Participant participant)
+        throws org.json.simple.parser.ParseException
+    {
+        if (!supportsLanguageRouting())
+        {
+            websocketUrl = websocketUrlConfig;
+            return;
+        }
+
+        org.json.simple.parser.JSONParser jsonParser = new org.json.simple.parser.JSONParser();
+        Object obj = jsonParser.parse(websocketUrlConfig);
+        org.json.simple.JSONObject languageMap = (org.json.simple.JSONObject) obj;
+        String language = participant.getSourceLanguage() != null ? participant.getSourceLanguage() : "en";
+        Object urlObject = languageMap.get(language);
+        if (!(urlObject instanceof String))
+        {
+            logger.error("No websocket URL configured for language " + language);
+            websocketUrl = null;
+            return;
+        }
+        websocketUrl = (String) urlObject;
+    }
+
+    /**
+     * Create a TranscriptionService which will send audio to the VOSK service
      * platform to get a transcription
      */
     public VoskTranscriptionService()
     {
-        websocketUrl = JigasiBundleActivator.getConfigurationService()
+        websocketUrlConfig = JigasiBundleActivator.getConfigurationService()
                 .getString(WEBSOCKET_URL, DEFAULT_WEBSOCKET_URL);
     }
 
@@ -82,6 +139,14 @@ public class VoskTranscriptionService
     public boolean isConfiguredProperly()
     {
         return true;
+    }
+
+    /**
+     * If the websocket url is a JSON, language routing is supported
+     */
+    public boolean supportsLanguageRouting()
+    {
+        return websocketUrlConfig.trim().startsWith("{");
     }
 
     /**
@@ -106,6 +171,7 @@ public class VoskTranscriptionService
                         "has unexpected" +
                         "encoding");
             }
+            Instant timeRequestReceived = Instant.now();
 
             WebSocketClient ws = new WebSocketClient();
             VoskWebsocketSession socket = new VoskWebsocketSession(request);
@@ -116,6 +182,7 @@ public class VoskTranscriptionService
                     new TranscriptionResult(
                             null,
                             UUID.randomUUID(),
+                            timeRequestReceived,
                             false,
                             request.getLocale().toLanguageTag(),
                             0,
@@ -133,7 +200,15 @@ public class VoskTranscriptionService
     {
         try
         {
-            return new VoskWebsocketStreamingSession(participant.getDebugName());
+            generateWebsocketUrl(participant);
+            VoskWebsocketStreamingSession streamingSession = new VoskWebsocketStreamingSession(
+                    participant.getDebugName());
+            streamingSession.transcriptionTag = participant.getTranslationLanguage();
+            if (streamingSession.transcriptionTag == null)
+            {
+                streamingSession.transcriptionTag = participant.getSourceLanguage();
+            }
+            return streamingSession;
         }
         catch (Exception e)
         {
@@ -168,12 +243,20 @@ public class VoskTranscriptionService
         private double sampleRate = -1.0;
         /* Last returned result so we do not return the same string twice */
         private String lastResult = "";
+        /* Transcription language requested by the user who requested the transcription */
+        private String transcriptionTag = "en-US";
 
         /**
          * List of TranscriptionListeners which will be notified when a
          * result comes in
          */
         private final List<TranscriptionListener> listeners = new ArrayList<>();
+
+        /**
+         *  Latest assigned UUID to a transcription result.
+         *  A new one has to be generated whenever a definitive result is received.
+         */
+        private UUID uuid = UUID.randomUUID();
 
         VoskWebsocketStreamingSession(String debugName)
             throws Exception
@@ -190,7 +273,7 @@ public class VoskTranscriptionService
             this.session = null;
         }
 
-        @OnWebSocketConnect
+        @OnWebSocketOpen
         public void onConnect(Session session)
         {
             this.session = session;
@@ -199,33 +282,59 @@ public class VoskTranscriptionService
         @OnWebSocketMessage
         public void onMessage(String msg)
         {
+            try
+            {
+                this.onMessageInternal(msg);
+            }
+            catch (ParseException e)
+            {
+                logger.error("Error parsing message: " + msg, e);
+            }
+        }
+
+        private void onMessageInternal(String msg)
+            throws ParseException
+        {
+            if (logger.isDebugEnabled())
+            {
+                logger.debug(debugName + "Received response: " + msg);
+            }
+
             boolean partial = true;
             String result = "";
-            if (logger.isDebugEnabled())
-                logger.debug(debugName + "Recieved response: " + msg);
-            JSONObject obj = new JSONObject(msg);
-            if (obj.has("partial"))
+            JSONObject obj = (JSONObject)jsonParser.get().parse(msg);
+            if (obj.containsKey("partial"))
             {
-                result = obj.getString("partial");
+                result = (String)obj.get("partial");
             }
             else
             {
                 partial = false;
-                result = obj.getString("text");
+                result = (String)obj.get("text");
             }
-            if (!result.isEmpty() && !result.equals(lastResult))
+
+            if (!result.isEmpty() && (!partial || !result.equals(lastResult)))
             {
                 lastResult = result;
                 for (TranscriptionListener l : listeners)
                 {
                     l.notify(new TranscriptionResult(
                             null,
-                            UUID.randomUUID(),
+                            uuid,
+                            // this time needs to be the one when the audio was sent
+                            // the results need to be matched with the time when we sent the audio, so we have
+                            // the real time when this transcription was started
+                            Instant.now(),
                             partial,
-                            "C",
+                            transcriptionTag,
                             1.0,
                             new TranscriptionAlternative(result)));
                 }
+            }
+
+            if (!partial)
+            {
+                this.uuid = UUID.randomUUID();
             }
         }
 
@@ -242,10 +351,10 @@ public class VoskTranscriptionService
                 if (sampleRate < 0)
                 {
                     sampleRate = request.getFormat().getSampleRate();
-                    session.getRemote().sendString("{\"config\" : {\"sample_rate\" : " + sampleRate + " }}");
+                    session.sendText("{\"config\" : {\"sample_rate\" : " + sampleRate + " }}", Callback.NOOP);
                 }
                 ByteBuffer audioBuffer = ByteBuffer.wrap(request.getAudio());
-                session.getRemote().sendBytes(audioBuffer);
+                session.sendBinary(audioBuffer, Callback.NOOP);
             }
             catch (Exception e)
             {
@@ -262,7 +371,7 @@ public class VoskTranscriptionService
         {
             try
             {
-                session.getRemote().sendString(EOF_MESSAGE);
+                session.sendText(EOF_MESSAGE, Callback.NOOP);
             }
             catch (Exception e)
             {
@@ -304,21 +413,14 @@ public class VoskTranscriptionService
             this.closeLatch.countDown(); // trigger latch
         }
 
-        @OnWebSocketConnect
+        @OnWebSocketOpen
         public void onConnect(Session session)
         {
-            try
-            {
-                AudioFormat format = request.getFormat();
-                session.getRemote().sendString("{\"config\" : {\"sample_rate\" : " + format.getSampleRate() + "}}");
-                ByteBuffer audioBuffer = ByteBuffer.wrap(request.getAudio());
-                session.getRemote().sendBytes(audioBuffer);
-                session.getRemote().sendString(EOF_MESSAGE);
-            }
-            catch (IOException e)
-            {
-                logger.error("Error to transcribe audio", e);
-            }
+            AudioFormat format = request.getFormat();
+            session.sendText("{\"config\" : {\"sample_rate\" : " + format.getSampleRate() + "}}", Callback.NOOP);
+            ByteBuffer audioBuffer = ByteBuffer.wrap(request.getAudio());
+            session.sendBinary(audioBuffer, Callback.NOOP);
+            session.sendText(EOF_MESSAGE, Callback.NOOP);
         }
 
         @OnWebSocketMessage

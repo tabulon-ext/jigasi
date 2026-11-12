@@ -31,14 +31,16 @@ import java.util.*;
 /**
  * Monitors outgoing RTCP and passes only those which are relevant for that
  * direction. Filters outgoing RTCP.BYEs for ssrc that we haven't seen. Also
- * monitors last seen media or rtcp and if one is missing we
- * send hole punch packets. It can happen that the xmpp call is dropped and
- * the sip call participant is waiting then there will be no media ot RTCP to
- * keep alive the stream from the other side.
+ * monitors the last outgoing RTP packet and, if there is none for a while,
+ * sends hole punch packets. It can happen that the xmpp call is dropped and
+ * the sip call participant is waiting, or that everybody else in the meeting
+ * is silent, then there is no media to keep alive the stream from the other
+ * side.
+ * Can be muted to stop forwarding packets coming from the sip side.
  *
  * @author Damian Minkov
  */
-public class SipCallKeepAliveTransformer
+public class SipCallTransformer
     extends SinglePacketTransformerAdapter
     implements TransformEngine
 {
@@ -64,7 +66,11 @@ public class SipCallKeepAliveTransformer
     private KeepAliveIncomingMedia recurringMediaChecker
         = new KeepAliveIncomingMedia(15000);
 
-    private long lastOutgoingActivity;
+    /**
+     * The time of the last outgoing RTP packet. Only RTP counts: RTCP can use
+     * a different port, so it does not keep the RTP flow alive.
+     */
+    private volatile long lastOutgoingActivity;
 
     /**
      * The peer handler for which we are adding this transformer.
@@ -77,10 +83,20 @@ public class SipCallKeepAliveTransformer
     private final MediaStream stream;
 
     /**
+     * If true we will mute the media, so we will not forward any media from the sip side.
+     */
+    private boolean mute = false;
+
+    /**
+     * Counter for the number of packets received.
+     * Used for passing through a packet while being muted, one on every 1000.
+     */
+    private long packetsCounter = 0;
+
+    /**
      * Initializes a new {@link SsrcRewriter} instance.
      */
-    public SipCallKeepAliveTransformer(
-        CallPeerMediaHandler handler, MediaStream stream)
+    public SipCallTransformer(CallPeerMediaHandler handler, MediaStream stream)
     {
         super(RTPPacketPredicate.INSTANCE);
 
@@ -116,7 +132,14 @@ public class SipCallKeepAliveTransformer
     @Override
     public RawPacket reverseTransform(RawPacket pkt)
     {
+        packetsCounter++;
         seenSSRCs.add(pkt.getSSRCAsLong());
+
+        // if muted we want to pass one packet every 1000 packets
+        if (mute && packetsCounter % 1000 != 0)
+        {
+            return null;
+        }
 
         return pkt;
     }
@@ -133,12 +156,22 @@ public class SipCallKeepAliveTransformer
     /**
      * Implements {@link TransformEngine#getRTCPTransformer()}.
      * <p>
-     * This <tt>TransformEngine</tt> does not transform RTCP packets.
+     * The returned transformer removes outgoing RTCP BYE packets for SSRCs
+     * that were not seen and passes the rest unchanged.
      */
     @Override
     public PacketTransformer getRTCPTransformer()
     {
         return rtcpTransformer;
+    }
+
+    /**
+     * Sets the mute state of this transformer.
+     * @param bMuted <tt>true</tt> to mute the media, <tt>false</tt> to unmute.
+     */
+    public void mute(boolean bMuted)
+    {
+        this.mute = bMuted;
     }
 
     /**
@@ -171,7 +204,6 @@ public class SipCallKeepAliveTransformer
 
             if (pkt.getLength() > 0)
             {
-                lastOutgoingActivity = System.currentTimeMillis();
                 return pkt;
             }
 
@@ -180,13 +212,25 @@ public class SipCallKeepAliveTransformer
     }
 
     /**
-     * Called periodically to check when was the last outgoing RTP or RTCP,
+     * Returns the time of the last outgoing RTP packet.
+     *
+     * @return the time in milliseconds, or 0 if no RTP packet was sent.
+     */
+    long getLastOutgoingActivity()
+    {
+        return lastOutgoingActivity;
+    }
+
+    /**
+     * Called periodically to check when was the last outgoing RTP,
      * if it was longer than a threshold we send hole punch packets to keep
      * media, as some providers can stop media till they see something coming.
-     * In this case all web participants can be muted and the bridge will not be
-     * forwarding any media so we can stop sending any media to the sip side
+     * In this case all other participants can be muted and the bridge will not
+     * be forwarding any media so we can stop sending any media to the sip side
      * and the incoming media can stop and participants will stop hearing that
-     * side.
+     * side. A NAT in front of us can also drop the incoming media once the
+     * mapping for the RTP port expires. RTCP does not prevent that when it
+     * uses a different port.
      */
     private class KeepAliveIncomingMedia
         extends PeriodicRunnable
@@ -236,7 +280,7 @@ public class SipCallKeepAliveTransformer
                             RawPacket.FIXED_HEADER_SIZE + 1);
 
                         stream.injectPacket(
-                            packet, true, SipCallKeepAliveTransformer.this);
+                            packet, true, SipCallTransformer.this);
 
                         ts += 160;
                     }

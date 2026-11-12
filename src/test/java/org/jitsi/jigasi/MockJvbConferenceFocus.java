@@ -21,7 +21,7 @@ import net.java.sip.communicator.service.protocol.*;
 import net.java.sip.communicator.service.protocol.event.*;
 import net.java.sip.communicator.service.protocol.mock.*;
 import net.java.sip.communicator.service.protocol.mock.muc.*;
-import net.java.sip.communicator.util.*;
+import org.jitsi.utils.logging.Logger;
 import org.osgi.framework.*;
 
 /**
@@ -50,6 +50,12 @@ public class MockJvbConferenceFocus
     private MockRoomMember myMember;
 
     private boolean leaveRoomAfterInvite;
+
+    /**
+     * When set, the session-initiate is sent from this JID instead of the focus occupant JID of the room. Used by the
+     * tests to exercise the reject path (an invite that does not come from the focus).
+     */
+    private String inviteFrom;
 
     public MockJvbConferenceFocus(String roomName)
     {
@@ -133,8 +139,10 @@ public class MockJvbConferenceFocus
             = (MockBasicTeleOpSet) member.getProtocolProvider()
                     .getOperationSet(OperationSetBasicTelephony.class);
 
+        // Mimic the focus sending the session-initiate from its occupant JID in the room (<room JID>/<focus>).
+        String from = inviteFrom != null ? inviteFrom : roomName + "/" + myName;
         xmppCall
-            = xmppTele.createIncomingCall(myMember.getName());
+            = xmppTele.createIncomingCall(from);
 
         logger.info(
             myName + " is inviting " + member.getName()
@@ -143,11 +151,25 @@ public class MockJvbConferenceFocus
         if (leaveRoomAfterInvite)
         {
             logger.info(myName + " invited peer will leave the room");
+
+            // let's leave after the xmpp call is in progress, as ended and connected will race for the call
             new Thread(new Runnable()
             {
                 @Override
                 public void run()
                 {
+                    try
+                    {
+                        logger.info("waiting for in progress on " + xmppCall);
+                        CallStateListener callStateWatch = new CallStateListener();
+                        callStateWatch.waitForState(xmppCall, CallState.CALL_IN_PROGRESS, 2000);
+                        logger.info("done waiting for in progress on " + xmppCall);
+                    }
+                    catch (InterruptedException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+
                     logger.info(myName + " leaving the room");
                     tearDown();
                 }
@@ -209,5 +231,10 @@ public class MockJvbConferenceFocus
     public void setLeaveRoomAfterInvite(boolean leaveRoomAfterInvite)
     {
         this.leaveRoomAfterInvite = leaveRoomAfterInvite;
+    }
+
+    public void setInviteFrom(String inviteFrom)
+    {
+        this.inviteFrom = inviteFrom;
     }
 }

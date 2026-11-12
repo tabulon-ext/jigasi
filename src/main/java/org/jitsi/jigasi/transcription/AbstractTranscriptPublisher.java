@@ -17,9 +17,6 @@
  */
 package org.jitsi.jigasi.transcription;
 
-import com.timgroup.statsd.*;
-import net.java.sip.communicator.impl.protocol.jabber.*;
-import net.java.sip.communicator.service.protocol.*;
 import org.jitsi.jigasi.*;
 import org.jitsi.service.libjitsi.*;
 import org.jitsi.service.neomedia.*;
@@ -28,6 +25,7 @@ import org.jitsi.service.neomedia.recording.*;
 import org.jitsi.utils.logging.*;
 
 import java.io.*;
+import java.nio.charset.*;
 import java.nio.file.*;
 import java.time.*;
 import java.util.*;
@@ -156,16 +154,6 @@ public abstract class AbstractTranscriptPublisher<T>
         = Logger.getLogger(AbstractTranscriptPublisher.class);
 
     /**
-     * Aspect for successful upload of transcript
-     */
-    private static final String DD_ASPECT_SUCCESS = "upload_success";
-
-    /**
-     * Aspect for failed upload of transcript
-     */
-    private static final String DD_ASPECT_FAIL = "upload_fail";
-
-    /**
      * Get a string which contains a time stamp and a random UUID, with an
      * optional pre- and suffix attached.
      *
@@ -186,76 +174,6 @@ public abstract class AbstractTranscriptPublisher<T>
             UUID.randomUUID(), suffix);
     }
 
-    /**
-     * Send a message to the muc room
-     *
-     * @param chatRoom the chatroom to send the message to
-     * @param message the message to send
-     */
-    protected void sendMessage(ChatRoom chatRoom, T message)
-    {
-        if (chatRoom == null)
-        {
-            logger.error("Cannot sent message as chatRoom is null");
-            return;
-        }
-
-        String messageString = message.toString();
-        Message chatRoomMessage = chatRoom.createMessage(messageString);
-        try
-        {
-            chatRoom.sendMessage(chatRoomMessage);
-            if (logger.isTraceEnabled())
-                logger.trace("Sending message: \"" + messageString + "\"");
-        }
-        catch (OperationFailedException e)
-        {
-            logger.warn("Failed to send message " + messageString, e);
-        }
-    }
-
-    /**
-     * Send a json-message to the muc room
-     *
-     * @param chatRoom the chatroom to send the message to
-     * @param jsonMessage the json message to send
-     */
-    protected void sendJsonMessage(ChatRoom chatRoom, T jsonMessage)
-    {
-        if (chatRoom == null)
-        {
-            logger.error("Cannot sent message as chatRoom is null");
-            return;
-        }
-
-        if (!(chatRoom instanceof ChatRoomJabberImpl))
-        {
-            logger.error("Cannot sent message as chatRoom is not an" +
-                "instance of ChatRoomJabberImpl");
-            return;
-        }
-
-        if (!chatRoom.isJoined())
-        {
-            if (logger.isDebugEnabled())
-            {
-                logger.debug("Skip sending message to room which we left!");
-            }
-            return;
-        }
-
-        String messageString = jsonMessage.toString();
-        try
-        {
-            ((ChatRoomJabberImpl)chatRoom).sendJsonMessage(messageString);
-            if (logger.isTraceEnabled())
-                logger.trace("Sending json message: \"" + messageString + "\"");
-        }
-        catch (OperationFailedException e)
-        {
-            logger.warn("Failed to send json message " + messageString, e);
-        }
-    }
     /**
      * Save a transcript given as a String to subdirectory of getLogDirPath()
      * with the given directory name and the given file name
@@ -286,7 +204,7 @@ public abstract class AbstractTranscriptPublisher<T>
 
         // and finally we can save the transcript
         File t = new File(subDirectoryPath.toString(), fileName);
-        try(FileWriter writer = new FileWriter(t))
+        try(FileWriter writer = new FileWriter(t, StandardCharsets.UTF_8))
         {
             writer.write(transcript);
             logger.info("Wrote final transcript to " + t);
@@ -843,46 +761,7 @@ public abstract class AbstractTranscriptPublisher<T>
                         logger.info("executing " + scriptPath +
                         " with arguments '" + absDirPath + "'");
 
-                        Process p = new ProcessBuilder(scriptPath.toString(),
-                            absDirPath.toString()).start();
-
-                        StatsDClient dClient
-                            = JigasiBundleActivator.getDataDogClient();
-                        if (dClient != null)
-                        {
-                            int returnValue;
-
-                            try
-                            {
-                                returnValue = p.waitFor();
-                            }
-                            catch (InterruptedException e)
-                            {
-                                logger.error("", e);
-                                returnValue = -1;
-                            }
-
-                            if (returnValue == 0)
-                            {
-                                dClient.increment(DD_ASPECT_SUCCESS);
-                                if (logger.isDebugEnabled())
-                                {
-                                    logger.debug("thrown stat: " +
-                                        DD_ASPECT_SUCCESS
-                                    );
-                                }
-                            }
-                            else
-                            {
-                                dClient.increment(DD_ASPECT_FAIL);
-                                if (logger.isDebugEnabled())
-                                {
-                                    logger.debug("thrown stat: " +
-                                        DD_ASPECT_FAIL
-                                    );
-                                }
-                            }
-                        }
+                        new ProcessBuilder(scriptPath.toString(), absDirPath.toString()).start();
                     }
                     catch (IOException e)
                     {

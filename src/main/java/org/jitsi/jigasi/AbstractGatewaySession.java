@@ -17,9 +17,12 @@
  */
 package org.jitsi.jigasi;
 
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import net.java.sip.communicator.service.protocol.*;
 import net.java.sip.communicator.service.protocol.event.*;
 import org.jitsi.jigasi.lobby.*;
+import org.jitsi.utils.*;
 import org.jivesoftware.smack.packet.*;
 
 import java.util.*;
@@ -95,6 +98,20 @@ public abstract class AbstractGatewaySession
         this.focusResourceAddr = JigasiBundleActivator.getConfigurationService()
             .getString(FOCUSE_RESOURCE_PROP, "focus");
 
+    }
+
+    /**
+     * @return an <tt>ObjectNode</tt> instance that holds debug
+     * information for this instance.
+     */
+    public ObjectNode getDebugState()
+    {
+        ObjectNode debugState = JsonNodeFactory.instance.objectNode();
+        if (jvbConference != null)
+        {
+            debugState.set("jvbConference", jvbConference.getDebugState());
+        }
+        return debugState;
     }
 
     /**
@@ -289,6 +306,23 @@ public abstract class AbstractGatewaySession
         for (GatewaySessionListener listener : gwListeners)
         {
             listener.onLobbyWaitReview(lobbyRoom);
+        }
+    }
+
+    /**
+     * Method called to notify that the conference is live or not live yet.
+     */
+    public void notifyConferenceLive(boolean v)
+    {
+        Iterable<GatewaySessionListener> gwListeners;
+        synchronized (listeners)
+        {
+            gwListeners = new ArrayList<>(listeners);
+        }
+
+        for (GatewaySessionListener listener : gwListeners)
+        {
+            listener.notifyConferenceLive(v);
         }
     }
 

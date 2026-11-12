@@ -17,11 +17,11 @@
  */
 package org.jitsi.jigasi.transcription.action;
 
-import net.java.sip.communicator.util.*;
+import net.java.sip.communicator.util.osgi.ServiceUtils;
 import org.jitsi.jigasi.transcription.*;
 import org.jitsi.service.configuration.*;
 import org.jitsi.utils.logging.Logger;
-import org.json.*;
+import org.json.simple.*;
 import org.osgi.framework.*;
 
 import java.util.*;
@@ -181,6 +181,7 @@ public class ActionServicesHandler
                 result = new TranscriptionResult(
                     result.getParticipant(),
                     result.getMessageID(),
+                    result.getTimeStamp(),
                     result.isInterim(),
                     result.getLanguage(),
                     result.getStability(),
@@ -249,7 +250,7 @@ public class ActionServicesHandler
         object.put(LocalJsonTranscriptHandler.JSON_KEY_EVENT_EVENT_TYPE,
             event.getEvent().toString());
         object.put(LocalJsonTranscriptHandler.JSON_KEY_EVENT_TIMESTAMP,
-            event.getTimeStamp().toString());
+            event.getTimeStamp().toEpochMilli());
 
         for (ActionHandler handler : actionSources.remove(roomName))
         {

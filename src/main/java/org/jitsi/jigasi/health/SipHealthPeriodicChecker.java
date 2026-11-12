@@ -20,6 +20,8 @@ package org.jitsi.jigasi.health;
 import net.java.sip.communicator.service.protocol.*;
 import net.java.sip.communicator.service.protocol.event.*;
 import net.java.sip.communicator.service.protocol.media.*;
+import org.apache.commons.lang3.StringUtils;
+import org.jitsi.impl.neomedia.device.*;
 import org.jitsi.jigasi.*;
 import org.jitsi.jigasi.sounds.*;
 import org.jitsi.jigasi.transcription.*;
@@ -163,7 +165,7 @@ class SipHealthPeriodicChecker
 
         healthCheckSipUri = conf.getString(PROP_HEALTH_CHECK_SIP_URI);
 
-        if (StringUtils.isNullOrEmpty(healthCheckSipUri))
+        if (StringUtils.isEmpty(StringUtils.trim(healthCheckSipUri)))
         {
             logger.warn(
                 "No health check started, no HEALTH_CHECK_SIP_URI prop.");
@@ -328,6 +330,7 @@ class SipHealthPeriodicChecker
             {
                 TranscribingAudioMixerMediaDevice mixer
                     = new TranscribingAudioMixerMediaDevice(
+                        new AudioSilenceMediaDevice(),
                        (receiveStream, buffer) ->
                             {
                                 receivedBuffer[0] = true;
@@ -381,7 +384,7 @@ class SipHealthPeriodicChecker
             String sessionInfo = (String)call.getData("X-session-info");
 
             throw new Exception("Health check call failed with no media! "
-                + sessionInfo != null ? "Session info:" + sessionInfo: "");
+                + (sessionInfo != null ? "Session info:" + sessionInfo: ""));
         }
     }
 

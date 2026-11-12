@@ -17,10 +17,13 @@
  */
 package org.jitsi.jigasi;
 
+import io.opentelemetry.api.trace.*;
+import net.java.sip.communicator.util.*;
+import org.apache.commons.lang3.StringUtils;
 import com.google.common.base.*;
 
-import net.java.sip.communicator.util.*;
-import org.jitsi.utils.*;
+import org.jetbrains.annotations.*;
+import org.jitsi.utils.logging2.*;
 import org.jxmpp.jid.*;
 import org.jxmpp.jid.impl.*;
 import org.jxmpp.stringprep.*;
@@ -34,8 +37,10 @@ import java.util.*;
  * @author Damian Minkov
  */
 public class CallContext
+    extends DataObject
 {
-    private final static Logger logger = Logger.getLogger(CallContext.class);
+    @NotNull
+    private final Logger logger = new LoggerImpl(CallContext.class.getName());
 
     /**
      * The name of the property that is used to define the MUC service address.
@@ -124,6 +129,11 @@ public class CallContext
     private String authUserId;
 
     /**
+     * Whether to request visitor when joining.
+     */
+    private boolean requestVisitor = false;
+
+    /**
      * Optional bosh url that we use to join a room with the
      * xmpp account.
      * The bosh URL is a pattern:
@@ -182,6 +192,20 @@ public class CallContext
     private final Map<String, String> extraHeaders = new HashMap<>();
 
     /**
+     * The tracing span covering the setup of this call (from the dial
+     * request or SIP INVITE until media is established or setup fails).
+     * <tt>null</tt> when tracing is disabled or no span was started.
+     */
+    private volatile Span setupSpan = null;
+
+    /**
+     * Whether {@link #setupSpan} has been ended. Spans must be ended exactly
+     * once, but success and failure paths can race during teardown.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean setupSpanEnded
+        = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
      * Constructs new CallContext saving the timestamp at which it was created.
      */
     public CallContext(Object source)
@@ -189,6 +213,7 @@ public class CallContext
         this.source = source;
         this.timestamp = System.currentTimeMillis();
         this.ctxId = this.timestamp + String.valueOf(super.hashCode());
+        logger.addContext("ctx", ctxId);
 
         if (boshHostsOverrides == null)
         {
@@ -204,6 +229,21 @@ public class CallContext
                 boshHostsOverrides = new HashMap<>();
             }
         }
+    }
+
+    public @NotNull Logger getLogger()
+    {
+        return logger;
+    }
+
+    /**
+     * Returns the unique id of this context. Attached to tracing spans so
+     * traces can be correlated with log entries ([ctx=...]).
+     * @return the context id.
+     */
+    public String getCtxId()
+    {
+        return ctxId;
     }
 
     /**
@@ -236,6 +276,7 @@ public class CallContext
         }
 
         this.roomJid = JidCreate.entityBareFrom(roomName);
+        logger.addContext("room", roomJid.toString());
 
         update();
     }
@@ -534,7 +575,7 @@ public class CallContext
             }
 
             // if boshURL or domain missing, do nothing
-            if (boshURL != null && !StringUtils.isNullOrEmpty(domain))
+            if (boshURL != null && StringUtils.isNotEmpty(StringUtils.trim(domain)))
             {
                 String boshHost = domain;
 
@@ -618,5 +659,75 @@ public class CallContext
     public Map<String, String> getExtraHeaders()
     {
         return Collections.unmodifiableMap(this.extraHeaders);
+    }
+
+    public boolean isRequestVisitor()
+    {
+        return requestVisitor;
+    }
+
+    public void setRequestVisitor(boolean requestVisitor)
+    {
+        this.requestVisitor = requestVisitor;
+    }
+
+    /**
+     * Sets the tracing span covering the setup of this call.
+     * @param span the span to set.
+     */
+    public void setSetupSpan(Span span)
+    {
+        this.setupSpan = span;
+    }
+
+    /**
+     * Returns the tracing span covering the setup of this call, if any.
+     * @return the span or <tt>null</tt>.
+     */
+    public Span getSetupSpan()
+    {
+        return this.setupSpan;
+    }
+
+    /**
+     * Records a milestone event on the call setup span, if one is active.
+     * @param name the event name.
+     */
+    public void traceEvent(String name)
+    {
+        Span span = this.setupSpan;
+        if (span != null && !setupSpanEnded.get())
+        {
+            span.addEvent(name);
+        }
+    }
+
+    /**
+     * Ends the call setup span successfully. Does nothing if the span was
+     * already ended or none was started.
+     */
+    public void endSetupSpan()
+    {
+        Span span = this.setupSpan;
+        if (span != null && setupSpanEnded.compareAndSet(false, true))
+        {
+            span.end();
+        }
+    }
+
+    /**
+     * Ends the call setup span with an error status. Does nothing if the
+     * span was already ended (e.g. the call was established and later hung
+     * up) or none was started.
+     * @param reason a description of the failure.
+     */
+    public void failSetupSpan(String reason)
+    {
+        Span span = this.setupSpan;
+        if (span != null && setupSpanEnded.compareAndSet(false, true))
+        {
+            span.setStatus(StatusCode.ERROR, reason == null ? "" : reason);
+            span.end();
+        }
     }
 }

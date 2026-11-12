@@ -17,15 +17,19 @@
  */
 package org.jitsi.jigasi.xmpp;
 
-import net.java.sip.communicator.util.*;
+import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.context.Context;
 import org.jitsi.jigasi.*;
+import org.jitsi.jigasi.util.TracingUtil;
+import org.jitsi.utils.logging.Logger;
 import org.jitsi.xmpp.extensions.rayo.*;
-import org.jitsi.xmpp.extensions.rayo.RayoIqProvider.*;
 import org.jitsi.service.configuration.*;
 import org.jivesoftware.smack.packet.*;
 import org.jxmpp.jid.*;
 import org.jxmpp.jid.impl.*;
 import org.jxmpp.stringprep.*;
+
+import java.util.*;
 
 /**
  *  Implementation of call control that is capable of utilizing Rayo
@@ -163,6 +167,7 @@ public class CallControl
         ctx.setDestination(to);
 
         String roomName = null;
+        String traceParentHeader = null;
 
         // extract the headers and pass them to context
         for (ExtensionElement ext: iq.getExtensions())
@@ -189,6 +194,12 @@ public class CallControl
                 {
                     ctx.setRoomPassword(value);
                 }
+                else if (TracingUtil.TRACEPARENT_HEADER.equalsIgnoreCase(name))
+                {
+                    // consumed here as the trace parent, re-added below with
+                    // our own span as the parent for the SIP leg
+                    traceParentHeader = value;
+                }
                 else
                 {
                     ctx.addExtraHeader(name, value);
@@ -196,8 +207,13 @@ public class CallControl
             }
         }
 
+        startDialSpan(iq, ctx, roomName, to, traceParentHeader);
+
         if (roomName == null)
+        {
+            ctx.failSetupSpan("No JvbRoomName header found");
             throw new RuntimeException("No JvbRoomName header found");
+        }
 
         logger.info(ctx +
             " Got dial request " + from + " -> " + to + " room: " + roomName);
@@ -210,8 +226,9 @@ public class CallControl
                 logger.error(ctx
                     + " Cannot accept dial request " + to + " because"
                     + " the TranscriptionGateway is disabled");
+                ctx.failSetupSpan("TranscriptionGateway is disabled");
                 return RefIq.createResult(iq,
-                    XMPPError.Condition.not_acceptable.toString());
+                    StanzaError.Condition.not_acceptable.toString());
             }
 
             session = transcriptionGateway.createOutgoingCall(ctx);
@@ -223,8 +240,9 @@ public class CallControl
                 logger.error(ctx
                     + " Cannot accept dial request " + to + " because"
                     + " the SipGateway is disabled");
+                ctx.failSetupSpan("SipGateway is disabled");
                 return RefIq.createResult(iq,
-                    XMPPError.Condition.not_acceptable.toString());
+                    StanzaError.Condition.not_acceptable.toString());
             }
 
             session = sipGateway.createOutgoingCall(ctx);
@@ -236,6 +254,52 @@ public class CallControl
         }
 
         return RefIq.createResult(iq, "xmpp:" + ctx.getCallResource());
+    }
+
+    /**
+     * Starts the tracing span covering this dial-out call setup and stores
+     * it in the call context. The span is parented from the
+     * <tt>traceparent</tt> extension on the dial IQ if present, or from an
+     * <tt>X-Traceparent</tt> Rayo header (W3C trace context format)
+     * otherwise. A no-op span is used when tracing is disabled.
+     *
+     * @param iq the dial IQ being handled.
+     * @param ctx the call context of the new call.
+     * @param roomName the room name extracted from the headers, may be null.
+     * @param to the dial destination.
+     * @param traceParentHeader the value of the X-Traceparent header, if any.
+     */
+    private void startDialSpan(DialIq iq, CallContext ctx, String roomName,
+        String to, String traceParentHeader)
+    {
+        Context remoteContext = TracingUtil.remoteContextFromIq(iq);
+        if (Span.fromContextOrNull(remoteContext) == null)
+        {
+            remoteContext
+                = TracingUtil.remoteContextFromW3CHeader(traceParentHeader);
+        }
+
+        Span setupSpan = TracingUtil.getTracer().spanBuilder("dial.out")
+            .setParent(remoteContext)
+            .setAttribute("client.id", Objects.toString(iq.getFrom()))
+            .setAttribute("room.id", Objects.toString(roomName))
+            .setAttribute("ctx.id", ctx.getCtxId())
+            .setAttribute("dial.type",
+                TRANSCRIPTION_DIAL_IQ_DESTINATION.equals(to)
+                    ? "transcription" : "sip")
+            .startSpan();
+
+        ctx.setSetupSpan(setupSpan);
+
+        // Propagate our context to the SIP leg. The extra headers are added
+        // to the outgoing SIP INVITE, and X- headers pass through
+        // intermediaries such as VoxImplant.
+        if (setupSpan.getSpanContext().isValid())
+        {
+            ctx.addExtraHeader(
+                TracingUtil.TRACEPARENT_HEADER,
+                TracingUtil.toW3CHeader(setupSpan.getSpanContext()));
+        }
     }
 
     /**

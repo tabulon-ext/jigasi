@@ -17,20 +17,25 @@
  */
 package org.jitsi.jigasi.xmpp;
 
+import static org.jitsi.jigasi.util.Util.*;
+import static org.jivesoftware.smack.packet.StanzaError.Condition.internal_server_error;
+
 import net.java.sip.communicator.impl.protocol.jabber.*;
 import net.java.sip.communicator.plugin.reconnectplugin.*;
 import net.java.sip.communicator.service.protocol.*;
 import net.java.sip.communicator.service.protocol.event.*;
-import net.java.sip.communicator.util.*;
+import net.java.sip.communicator.util.osgi.*;
 import org.jitsi.jigasi.*;
 import org.jitsi.jigasi.stats.*;
 import org.jitsi.jigasi.util.*;
+import org.jitsi.utils.logging.Logger;
 import org.jitsi.xmpp.extensions.rayo.*;
-import org.jitsi.xmpp.extensions.rayo.RayoIqProvider.*;
 import org.jitsi.service.configuration.*;
 import org.jivesoftware.smack.*;
+import org.jivesoftware.smack.bosh.*;
 import org.jivesoftware.smack.iqrequest.*;
 import org.jivesoftware.smack.packet.*;
+import org.jivesoftware.smackx.disco.*;
 import org.jxmpp.jid.parts.*;
 import org.osgi.framework.*;
 
@@ -49,8 +54,8 @@ import java.util.stream.*;
  * @author Nik Vaessen
  */
 public class CallControlMucActivator
-    implements BundleActivator,
-               ServiceListener,
+    extends DependentActivator
+    implements ServiceListener,
                RegistrationStateChangeListener,
                GatewaySessionListener,
                GatewayListener
@@ -58,8 +63,7 @@ public class CallControlMucActivator
     /**
      * The logger
      */
-    private final static Logger logger
-        = Logger.getLogger(CallControlMucActivator.class);
+    private final static Logger logger = Logger.getLogger(CallControlMucActivator.class);
 
     private static BundleContext osgiContext;
 
@@ -74,10 +78,17 @@ public class CallControlMucActivator
      */
     private CallControl callControl = null;
 
+    private ConfigurationService configService;
+
     /**
      * The thread pool to serve all call control operations.
      */
     private static ExecutorService threadPool = Util.createNewThreadPool("jigasi-callcontrol");
+
+    public CallControlMucActivator()
+    {
+        super(ConfigurationService.class);
+    }
 
     /**
      * Starts muc control component. Finds all xmpp accounts and listen for
@@ -85,12 +96,10 @@ public class CallControlMucActivator
      * @param bundleContext the bundle context
      */
     @Override
-    public void start(final BundleContext bundleContext)
-        throws Exception
+    public void startWithServices(final BundleContext bundleContext)
     {
         osgiContext = bundleContext;
-
-        ConfigurationService config = getConfigurationService();
+        configService = getService(ConfigurationService.class);
 
         osgiContext.addServiceListener(this);
 
@@ -108,7 +117,7 @@ public class CallControlMucActivator
 
         TranscriptionGateway transcriptionGateway = ServiceUtils.getService(bundleContext, TranscriptionGateway.class);
 
-        this.callControl = new CallControl(config);
+        this.callControl = new CallControl(configService);
 
         if (sipGateway != null)
         {
@@ -153,15 +162,6 @@ public class CallControlMucActivator
     }
 
     /**
-     * Returns <tt>ConfigurationService</tt> instance.
-     * @return <tt>ConfigurationService</tt> instance.
-     */
-    private static ConfigurationService getConfigurationService()
-    {
-        return ServiceUtils.getService(osgiContext, ConfigurationService.class);
-    }
-
-    /**
      * Returns timeout value for room join waiting.
      */
     public static long getMucJoinWaitTimeout()
@@ -192,7 +192,7 @@ public class CallControlMucActivator
 
             if (this.callControl == null)
             {
-                this.callControl = new CallControl(gateway, getConfigurationService());
+                this.callControl = new CallControl(gateway, configService);
             }
             else
             {
@@ -206,7 +206,7 @@ public class CallControlMucActivator
 
             if (this.callControl == null)
             {
-                this.callControl = new CallControl(gateway, getConfigurationService());
+                this.callControl = new CallControl(gateway, configService);
             }
             else
             {
@@ -225,15 +225,22 @@ public class CallControlMucActivator
         if (!ProtocolNames.JABBER.equals(pps.getProtocolName())
             || pps.getAccountID().getAccountPropertyString(ROOM_NAME_ACCOUNT_PROP) == null)
         {
+            if (logger.isDebugEnabled())
+            {
+                logger.debug("Drop provider - not xmpp or no room name account property:" + pps);
+            }
+
             return;
         }
 
         pps.addRegistrationStateChangeListener(this);
 
-        ProtocolProviderFactory xmppProviderFactory
-            = ProtocolProviderFactory.getProtocolProviderFactory(osgiContext, ProtocolNames.JABBER);
+        if (logger.isDebugEnabled())
+        {
+            logger.debug("Will register new control muc provider:" + describeProvider(pps));
+        }
 
-        new RegisterThread(pps, xmppProviderFactory.loadPassword(pps.getAccountID())).start();
+        new RegisterThread(pps, pps.getAccountID().getPassword()).start();
     }
 
     /**
@@ -245,13 +252,19 @@ public class CallControlMucActivator
     @Override
     public void registrationStateChanged(RegistrationStateChangeEvent evt)
     {
+        threadPool.execute(() -> registrationStateChangedInternal(evt));
+    }
+
+    private void registrationStateChangedInternal(RegistrationStateChangeEvent evt)
+    {
         ProtocolProviderService provider = evt.getProvider();
 
         if (logger.isDebugEnabled()
             && provider instanceof ProtocolProviderServiceJabberImpl
             && provider.getAccountID().getAccountPropertyString(ROOM_NAME_ACCOUNT_PROP) != null)
         {
-            logger.debug("Got control muc provider " + provider + " new state -> " + evt.getNewState() );
+            logger.debug("Got control muc provider " + describeProvider(provider)
+                + " new state -> " + evt.getNewState(), new Exception());
         }
 
         if (evt.getNewState() == RegistrationState.REGISTERED)
@@ -274,7 +287,7 @@ public class CallControlMucActivator
 
         try
         {
-            logger.info("Joining call control room: " + roomName + " pps:" + pps);
+            logger.info("Joining call control room: " + roomName + " pps:" + describeProvider(pps));
             Resourcepart connectionResource = null;
 
             // getting direct access to the xmpp connection in order to add
@@ -290,6 +303,9 @@ public class CallControlMucActivator
                 conn.registerIQRequestHandler(new HangUpIqHandler(pps));
 
                 connectionResource = conn.getUser().getResourceOrNull();
+
+                // to make sure EntityCapsManager.currentCapsVersion is properly initialized
+                ServiceDiscoveryManager.getInstanceFor(conn).addFeature(JIGASI_FEATURE_NAME);
             }
 
             OperationSetMultiUserChat muc = pps.getOperationSet(OperationSetMultiUserChat.class);
@@ -303,6 +319,17 @@ public class CallControlMucActivator
             {
                 mucRoom.join();
             }
+
+            XMPPConnection connection;
+            Object boshSessionId = null;
+            if (pps instanceof ProtocolProviderServiceJabberImpl &&
+                (connection = ((ProtocolProviderServiceJabberImpl) pps).getConnection()) != null
+                && connection instanceof XMPPBOSHConnection)
+            {
+                boshSessionId = Util.getConnSessionId(connection);
+            }
+            logger.info("Joined call control room: " + roomName + " pps:" + describeProvider(pps)
+                + " nickname:" + mucRoom.getUserNickname() + " sessionId:" + boshSessionId);
 
             // sends initial stats, used some kind of advertising
             // so jicofo can recognize us as real jigasi and load balance us
@@ -331,8 +358,7 @@ public class CallControlMucActivator
 
         try
         {
-            logger.info(
-                "Leaving call control room: " + roomName + " pps:" + pps);
+            logger.info("Leaving call control room: " + roomName + " pps:" + describeProvider(pps));
 
             OperationSetMultiUserChat muc = pps.getOperationSet(OperationSetMultiUserChat.class);
 
@@ -353,6 +379,10 @@ public class CallControlMucActivator
     {
         updatePresenceStatusForXmppProviders();
     }
+
+    @Override
+    public void notifyConferenceLive(boolean v)
+    {}
 
     @Override
     public void onLobbyWaitReview(ChatRoom lobbyRoom)
@@ -472,8 +502,9 @@ public class CallControlMucActivator
         if (accountID != null)
         {
             // uninstall will first unregister the account
+            logger.info("Removing muc control account: " + id + ", " + accountID);
             boolean result = xmppProviderFactory.uninstallAccount(accountID);
-            logger.info("Removing muc control account: " + id + ", " + accountID + ", successful:" + result);
+            logger.info("Removed muc control account: " + id + ", " + accountID + ", successful:" + result);
 
             // cleanup
             config.removeProperty(
@@ -512,6 +543,37 @@ public class CallControlMucActivator
     }
 
     /**
+     * Returns descriptive string for the provider, including the id from the config.
+     * @param provider the provider.
+     * @return the description string to print.
+     */
+    private static String describeProvider(ProtocolProviderService provider)
+    {
+        AccountID acc = provider.getAccountID();
+        ConfigurationService config = JigasiBundleActivator.getConfigurationService();
+        ProtocolProviderFactory xmppProviderFactory
+            = ProtocolProviderFactory.getProtocolProviderFactory(osgiContext, ProtocolNames.JABBER);
+        AccountManager accountManager = ProtocolProviderActivator.getAccountManager();
+
+        String propPrefix = accountManager.getFactoryImplPackageName(xmppProviderFactory);
+
+        String id = config.getPropertyNamesByPrefix(propPrefix, false)
+            .stream()
+            // we get any account id property
+            .filter(p -> p.endsWith(ProtocolProviderFactory.ACCOUNT_UID))
+            // we check for the value of account id
+            .filter(p -> config.getString(p).equals(acc.getAccountUniqueID()))
+            // get the id
+            .map(p -> p.substring(
+                propPrefix.length() + 1, // the prefix and '.'
+                p.indexOf(ProtocolProviderFactory.ACCOUNT_UID) - 1))
+            .findFirst().orElse(null); // property and the '.'
+
+
+        return provider + ", id:" + id;
+    }
+
+    /**
      * Packet listener per protocol provider. Used to get the custom
      * bosh URL property from its account properties and to pass it when
      * processing incoming iq.
@@ -521,7 +583,7 @@ public class CallControlMucActivator
     {
         DialIqHandler(ProtocolProviderService pps)
         {
-            super(DialIq.ELEMENT_NAME, IQ.Type.set, pps);
+            super(DialIq.ELEMENT, IQ.Type.set, pps);
         }
 
         @Override
@@ -541,17 +603,21 @@ public class CallControlMucActivator
                             }
                             catch(SmackException.NotConnectedException | InterruptedException e)
                             {
-                                logger.error(ctx + " Cannot send reply for dialIQ:" + packet.toXML());
+                                logger.error(
+                                        ctx + " Cannot send reply for dialIQ:"
+                                                + packet.toXML());
                             }
                         }
                     });
             }
-            catch(RejectedExecutionException e)
+            catch (RejectedExecutionException e)
             {
                 logger.error(ctx + " Failed to handle incoming dialIQ:" + packet.toXML());
 
-                return IQ.createErrorResponse(packet, XMPPError.from(
-                    XMPPError.Condition.internal_server_error, e.getMessage()));
+                return IQ.createErrorResponse(packet, StanzaError.getBuilder()
+                    .setCondition(internal_server_error)
+                    .setConditionText(e.getMessage())
+                    .build());
             }
 
             return null;
@@ -582,8 +648,8 @@ public class CallControlMucActivator
             catch (Exception e)
             {
                 logger.error(ctx + " Error processing RayoIq", e);
-                return IQ.createErrorResponse(packet, XMPPError.from(
-                    XMPPError.Condition.internal_server_error, e.getMessage()));
+                return IQ.createErrorResponse(packet, StanzaError.from(
+                    StanzaError.Condition.internal_server_error, e.getMessage()).build());
             }
         }
 
@@ -628,11 +694,19 @@ public class CallControlMucActivator
                 room = waiter.lobbyRoom;
             }
 
-            response.setUri("xmpp:" + room.getIdentifier() + "/" + room.getUserNickname());
+            // room can be null when the meeting is not live yet
+            if (room != null)
+            {
+                response.setUri("xmpp:" + room.getIdentifier() + "/" + room.getUserNickname());
 
-            final XMPPConnection roomConnection = ((ProtocolProviderServiceJabberImpl) room.getParentProvider())
-                .getConnection();
-            roomConnection.registerIQRequestHandler(new HangUpIqHandler(room.getParentProvider()));
+                final XMPPConnection roomConnection = ((ProtocolProviderServiceJabberImpl) room.getParentProvider())
+                        .getConnection();
+                roomConnection.registerIQRequestHandler(new HangUpIqHandler(room.getParentProvider()));
+            }
+            else
+            {
+                logger.warn("Room is null for session: " + session);
+            }
         }
     }
 
@@ -656,6 +730,15 @@ public class CallControlMucActivator
         public void onJvbRoomJoined(AbstractGatewaySession source)
         {
             countDownLatch.countDown();
+        }
+
+        @Override
+        public void notifyConferenceLive(boolean live)
+        {
+            if (!live)
+            {
+                countDownLatch.countDown();
+            }
         }
 
         @Override
@@ -693,7 +776,7 @@ public class CallControlMucActivator
     {
         HangUpIqHandler(ProtocolProviderService pps)
         {
-            super(HangUp.ELEMENT_NAME, IQ.Type.set, pps);
+            super(HangUp.ELEMENT, IQ.Type.set, pps);
         }
 
         @Override
@@ -705,7 +788,7 @@ public class CallControlMucActivator
         }
     }
 
-    private abstract class RayoIqHandler<T extends RayoIq>
+    private static abstract class RayoIqHandler<T extends RayoIq>
         extends AbstractIqRequestHandler
     {
         protected ProtocolProviderService pps;

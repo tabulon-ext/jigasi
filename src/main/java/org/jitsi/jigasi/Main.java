@@ -17,18 +17,45 @@
  */
 package org.jitsi.jigasi;
 
+import java.util.*;
+import net.java.sip.communicator.impl.certificate.*;
 import net.java.sip.communicator.impl.configuration.*;
+import net.java.sip.communicator.impl.credentialsstorage.*;
+import net.java.sip.communicator.impl.dns.*;
+import net.java.sip.communicator.impl.globaldisplaydetails.*;
+import net.java.sip.communicator.impl.neomedia.*;
+import net.java.sip.communicator.impl.netaddr.*;
+import net.java.sip.communicator.impl.packetlogging.*;
+import net.java.sip.communicator.impl.phonenumbers.*;
 import net.java.sip.communicator.impl.protocol.jabber.*;
+import net.java.sip.communicator.impl.protocol.sip.*;
+import net.java.sip.communicator.impl.resources.*;
+import net.java.sip.communicator.plugin.defaultresourcepack.*;
+import net.java.sip.communicator.plugin.reconnectplugin.*;
+import net.java.sip.communicator.service.gui.internal.*;
+import net.java.sip.communicator.service.notification.*;
 import net.java.sip.communicator.service.protocol.*;
 
-import org.jitsi.cmd.*;
+import net.java.sip.communicator.service.protocol.media.*;
+import net.java.sip.communicator.util.*;
+import org.apache.commons.lang3.*;
+import org.jitsi.impl.osgi.framework.launch.*;
+import org.jitsi.jigasi.cmd.*;
 import org.jitsi.jigasi.osgi.*;
+import org.jitsi.jigasi.rest.*;
+import org.jitsi.jigasi.version.*;
+import org.jitsi.jigasi.xmpp.*;
 import org.jitsi.meet.*;
+import org.jitsi.osgi.framework.*;
 import org.jitsi.service.configuration.*;
+import org.jitsi.service.libjitsi.*;
 import org.jitsi.service.neomedia.*;
-import org.jitsi.utils.*;
 import org.jivesoftware.smack.*;
+import org.jivesoftware.smack.debugger.*;
 import org.jivesoftware.smack.tcp.*;
+import org.osgi.framework.*;
+import org.osgi.framework.launch.*;
+import org.osgi.framework.startlevel.*;
 
 /**
  * The gateway for Jitsi Videobridge conferences. Requires one SIP
@@ -125,7 +152,6 @@ public class Main
             "org.jivesoftware.smackx.si",
             "org.jivesoftware.smackx.vcardtemp",
             "org.jivesoftware.smackx.xhtmlim",
-            "org.jivesoftware.smackx.xdata",
             "org.jivesoftware.smackx.eme",
             "org.jivesoftware.smackx.iqprivate",
             "org.jivesoftware.smackx.bookmarks",
@@ -137,7 +163,7 @@ public class Main
         };
 
     public static void main(String[] args)
-        throws ParseException
+        throws ParseException, BundleException, InterruptedException
     {
         // Parse the command-line arguments.
         CmdLine cmdLine = new CmdLine();
@@ -196,14 +222,14 @@ public class Main
             ConfigurationService.PNAME_SC_HOME_DIR_NAME,
             configDirName);
 
-        Boolean isConfigReadonly =
-            !Boolean.valueOf(cmdLine.getOptionValue(CONFIG_WRITABLE_ARG_NAME));
+        boolean isConfigReadonly =
+            !Boolean.parseBoolean(cmdLine.getOptionValue(CONFIG_WRITABLE_ARG_NAME));
         System.setProperty(
             ConfigurationService.PNAME_CONFIGURATION_FILE_IS_READ_ONLY,
-            isConfigReadonly.toString());
+            Boolean.toString(isConfigReadonly));
 
         String logdir = cmdLine.getOptionValue(LOGDIR_ARG_NAME);
-        if (!StringUtils.isNullOrEmpty(logdir))
+        if (StringUtils.isNotEmpty(logdir))
         {
             System.setProperty(PNAME_SC_LOG_DIR_LOCATION, logdir);
             // set it same as cache dir so if something is written lets write it
@@ -223,19 +249,110 @@ public class Main
                 ".SKIP_REINVITE_ON_FOCUS_CHANGE_PROP",
             "true");
 
+        // Those are not used so disable them
+        String deviceSystemPackage = "org.jitsi.impl.neomedia.device";
+        System.setProperty(deviceSystemPackage + ".MacCoreaudioSystem.disabled", "true");
+        System.setProperty(deviceSystemPackage + ".PulseAudioSystem.disabled", "true");
+        System.setProperty(deviceSystemPackage + ".PortAudioSystem.disabled", "true");
+
+        System.setProperty("jdk.xml.entityExpansionLimit", "0");
+        System.setProperty("jdk.xml.maxOccurLimit", "0");
+        System.setProperty("jdk.xml.elementAttributeLimit", "524288");
+        System.setProperty("jdk.xml.totalEntitySizeLimit", "0");
+        System.setProperty("jdk.xml.maxXMLNameLimit", "524288");
+        System.setProperty("jdk.xml.entityReplacementLimit", "0");
+
         // disable smack packages before loading smack
         disableSmackProviders();
 
+        ReflectionDebuggerFactory.setDebuggerClass(JulDebugger.class);
         SmackConfiguration.setDefaultReplyTimeout(15000);
+        // temporary workaround for stalled bosh connections that can block smack, will be removed in 4.5.
+        SmackConfiguration.TRUELY_ASYNC_SENDS = true;
 
         // Disable stream management as it could lead to unexpected behaviour,
         // because we do not account for that to happen.
         XMPPTCPConnection.setUseStreamManagementDefault(false);
         XMPPTCPConnection.setUseStreamManagementResumptionDefault(false);
 
-        ComponentMain main = new ComponentMain();
+        JigasiBundleConfig.setSystemPropertyDefaults();
+        List<Class<? extends BundleActivator>> protocols = List.of(
+            SipActivator.class,
+            JabberActivator.class);
+        var fw = start(protocols);
 
-        main.runMainProgramLoop(new JigasiBundleConfig());
+        // register shutdown service so we can cleanly stop the framework
+        fw.getBundleContext().registerService(
+            ShutdownService.class, () -> {
+                try
+                {
+                    fw.stop();
+
+                    // give some time to tear down everything before exiting
+                    Thread.sleep(3000);
+
+                    System.exit(0);
+                }
+                catch(Exception e)
+                {
+                    e.printStackTrace();
+
+                    System.exit(-1);
+                }
+            }, null);
+        fw.waitForStop(0);
+    }
+
+    public static Framework start(List<Class<? extends BundleActivator>> protocols)
+        throws BundleException, InterruptedException
+    {
+        List<Class<? extends BundleActivator>> activators = new ArrayList<>(List.of(
+            LibJitsiActivator.class,
+            ConfigurationActivator.class,
+            UtilActivator.class,
+            DefaultResourcePackActivator.class,
+            ResourceManagementActivator.class,
+            NotificationServiceActivator.class,
+            DnsUtilActivator.class,
+            CredentialsStorageActivator.class,
+            NetaddrActivator.class,
+            PacketLoggingActivator.class,
+            GuiServiceActivator.class,
+            ProtocolMediaActivator.class,
+            NeomediaActivator.class,
+            CertificateVerificationActivator.class,
+            VersionActivator.class,
+            ProtocolProviderActivator.class,
+            GlobalDisplayDetailsActivator.class,
+            ReconnectPluginActivator.class,
+            PhoneNumberServiceActivator.class,
+            EmptyHidServiceActivator.class,
+            EmptyUiServiceActivator.class,
+            EmptyMasterPasswordInputServiceActivator.class
+        ));
+        activators.addAll(protocols);
+        activators.addAll(List.of(
+            JigasiBundleActivator.class,
+            RESTBundleActivator.class,
+            TranscriptServerBundleActivator.class,
+            CallControlMucActivator.class
+        ));
+        var options = new HashMap<String, String>();
+        options.put(Constants.FRAMEWORK_BEGINNING_STARTLEVEL, "3");
+        Framework fw = new FrameworkImpl(options, Main.class.getClassLoader());
+        fw.init();
+        var bundleContext = fw.getBundleContext();
+        for (Class<? extends BundleActivator> activator : activators)
+        {
+            var url = activator.getProtectionDomain().getCodeSource().getLocation().toString();
+            var bundle = bundleContext.installBundle(url);
+            var startLevel = bundle.adapt(BundleStartLevel.class);
+            startLevel.setStartLevel(2);
+            var bundleActivator = bundle.adapt(BundleActivatorHolder.class);
+            bundleActivator.addBundleActivator(activator);
+        }
+        fw.start();
+        return fw;
     }
 
     /**

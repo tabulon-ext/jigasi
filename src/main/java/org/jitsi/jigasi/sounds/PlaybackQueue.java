@@ -18,12 +18,12 @@
 package org.jitsi.jigasi.sounds;
 
 import net.java.sip.communicator.service.protocol.*;
-import net.java.sip.communicator.util.*;
 import org.jitsi.jigasi.*;
 
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import org.jitsi.utils.logging.Logger;
 
 /**
  * Used to queue audio files for playback. This is used for the IVR.
@@ -85,21 +85,30 @@ class PlaybackQueue
          *
          * @return File to play.
          */
-        String getPlaybackFileName() { return playbackFileName; }
+        String getPlaybackFileName()
+        {
+            return playbackFileName;
+        }
 
         /**
          * Used to run specific code.
          *
          * @return <tt>PlaybackDelegate</tt>
          */
-        PlaybackDelegate getPlaybackDelegate() { return playbackDelegate; }
+        PlaybackDelegate getPlaybackDelegate()
+        {
+            return playbackDelegate;
+        }
 
         /**
          * Returns the caller.
          *
          * @return Call to send audio to.
          */
-        Call getPlaybackCall() { return playbackCall; }
+        Call getPlaybackCall()
+        {
+            return playbackCall;
+        }
 
         /**
          * Checks for equals by just checking the filename as this is what is to be played.

@@ -17,18 +17,17 @@
  */
 package org.jitsi.jigasi.transcription;
 
-import com.timgroup.statsd.*;
 import net.java.sip.communicator.impl.protocol.jabber.*;
 import net.java.sip.communicator.service.protocol.*;
 import org.jitsi.impl.neomedia.device.*;
 import org.jitsi.jigasi.*;
+import org.jitsi.jigasi.stats.*;
 import org.jitsi.jigasi.transcription.action.*;
-import org.jitsi.utils.logging.*;
-import org.jitsi.xmpp.extensions.jitsimeet.TranscriptionLanguageExtension;
-import org.jitsi.xmpp.extensions.jitsimeet.TranslationLanguageExtension;
-import org.jivesoftware.smack.packet.Presence;
+import org.jitsi.utils.logging2.*;
+import org.jitsi.xmpp.extensions.jitsimeet.*;
+import org.jivesoftware.smack.packet.*;
 
-import javax.media.Buffer;
+import javax.media.*;
 import javax.media.rtp.*;
 import java.util.*;
 import java.util.concurrent.*;
@@ -46,22 +45,7 @@ public class Transcriber
     /**
      * The logger of this class
      */
-    private final static Logger logger = Logger.getLogger(Transcriber.class);
-
-    /**
-     * Datadog aspect for failing the transcription process.
-     */
-    private final static String DD_ASPECT_FAILED = "failed_transcriber";
-
-    /**
-     * Datadog aspect for starting transcribing
-     */
-    private final static String DD_ASPECT_START = "start_transcriber";
-
-    /**
-     * Datadog aspect for ending transcribing
-     */
-    private final static String DD_ASPECT_STOP = "stop_transcriber";
+    private final Logger logger;
 
     /**
      * The property name for the boolean value whether translations should be
@@ -142,18 +126,15 @@ public class Transcriber
      */
     private Transcript transcript = new Transcript();
 
-    /**
-     * The MediaDevice which will get all audio to transcribe
-     */
-    private TranscribingAudioMixerMediaDevice mediaDevice
-        = new TranscribingAudioMixerMediaDevice(this);
+
+    private static final String CUSTOM_TRANSLATION_SERVICE_PROP
+            = "org.jitsi.jigasi.transcription.translationService";
 
     /**
      * The TranslationManager and the TranslationService which will be used
      * for managing translations.
      */
-    private TranslationManager translationManager
-        = new TranslationManager(new GoogleCloudTranslationService());
+    private TranslationManager translationManager = null;
 
     /**
      * Every listener which will be notified when a new result comes in
@@ -172,7 +153,7 @@ public class Transcriber
      * The service which is used to send audio and receive the
      * transcription of said audio
      */
-    private TranscriptionService transcriptionService;
+    private AbstractTranscriptionService transcriptionService;
 
     /**
      * A single thread which is used to manage the buffering and sending
@@ -180,7 +161,7 @@ public class Transcriber
      * with all packets, which only has 20 ms before new packets come in.
      * <p>
      * Will be created in {@link Transcriber#start()} and shutdown in
-     * {@link Transcriber#stop(FailureReason)}
+     * {@link Transcriber#stop(org.jitsi.jigasi.transcription.TranscriptionListener.FailureReason)}
      */
     ExecutorService executorService;
 
@@ -198,7 +179,12 @@ public class Transcriber
      * Whether silenced audio should be filtered out before sending audio to
      * a {@link TranscriptionService}.
      */
-    private boolean filterSilence = shouldFilterSilence();
+    private boolean filterSilence;
+
+    /**
+     * The call context.
+     */
+    final private CallContext context;
 
     /**
      * Create a transcription object which can be used to add and remove
@@ -207,22 +193,28 @@ public class Transcriber
      *
      * @param roomName the room name the transcription will take place in
      * @param roomUrl the url of the conference being transcribed
-     * @param service the transcription service which will be used to transcribe
-     * the audio streams
+     * @param service the transcription service which will be used to transcribe the audio streams
+     * @param context  the call context.
      */
     public Transcriber(String roomName,
                        String roomUrl,
-                       TranscriptionService service)
+                       AbstractTranscriptionService service,
+                       CallContext context,
+                       Logger parentLogger)
     {
+        this.logger = parentLogger.createChildLogger(Transcriber.class.getName());
+        this.context = context;
+
         if (!service.supportsStreamRecognition())
         {
             throw new IllegalArgumentException(
-                    "Currently only services which support streaming "
-                    + "recognition are supported");
+                "Currently only services which support streaming recognition are supported");
         }
         this.transcriptionService = service;
         addTranscriptionListener(this.transcript);
+        this.filterSilence = shouldFilterSilence();
 
+        configureTranslationManager();
         if (isTranslationEnabled())
         {
             addTranscriptionListener(this.translationManager);
@@ -239,18 +231,42 @@ public class Transcriber
      * @param service the transcription service which will be used to transcribe
      * the audio streams
      */
-    public Transcriber(TranscriptionService service)
+    public Transcriber(AbstractTranscriptionService service, CallContext context, Logger parentLogger)
     {
-        this(null, null, service);
+        this(null, null, service, context, parentLogger);
     }
 
     /**
-     * A debug name added to every log message printed by this instance.
-     *
-     * @return a {@code String}
+     * Create the translationManager using the custom translation service configured by the user.
+     * Fallback to GoogleTranslationService if no custom translation service configuration.
      */
-    private String getDebugName() {
-        return roomName;
+    public void configureTranslationManager()
+    {
+        String customTranslationServiceClass = JigasiBundleActivator.getConfigurationService()
+                .getString(CUSTOM_TRANSLATION_SERVICE_PROP, null);
+
+        TranslationService translationService = null;
+        if (customTranslationServiceClass != null)
+        {
+            try
+            {
+                translationService = (TranslationService)Class
+                        .forName(customTranslationServiceClass)
+                        .getDeclaredConstructor()
+                        .newInstance();
+            }
+            catch(Exception e)
+            {
+                logger.error("Cannot instantiate custom translation service");
+            }
+        }
+
+        if (translationService == null)
+        {
+            translationService = new GoogleCloudTranslationService();
+        }
+
+        translationManager = new TranslationManager(translationService);
     }
 
     /**
@@ -273,16 +289,12 @@ public class Transcriber
             }
 
             if (logger.isDebugEnabled())
-                logger.debug(
-                    getDebugName()
-                        + ": added participant with identifier " + identifier);
+                logger.debug("added participant with identifier " + identifier);
 
             return;
         }
 
-        logger.warn(
-            getDebugName() + ": participant with identifier " + identifier
-                +  " joined while it did not exist");
+        logger.warn("participant with identifier " + identifier + " joined while it did not exist");
 
     }
 
@@ -324,14 +336,10 @@ public class Transcriber
                 Presence presence = ((ChatRoomMemberJabberImpl) chatRoomMember).getLastPresence();
 
                 TranscriptionLanguageExtension transcriptionLanguageExtension
-                    = presence.getExtension(
-                        TranscriptionLanguageExtension.ELEMENT_NAME,
-                        TranscriptionLanguageExtension.NAMESPACE);
+                    = presence.getExtension(TranscriptionLanguageExtension.class);
 
                 TranslationLanguageExtension translationLanguageExtension
-                    = presence.getExtension(
-                        TranslationLanguageExtension.ELEMENT_NAME,
-                        TranslationLanguageExtension.NAMESPACE);
+                    = presence.getExtension(TranslationLanguageExtension.class);
 
                 if (transcriptionLanguageExtension != null)
                 {
@@ -347,7 +355,11 @@ public class Transcriber
                     String language
                         = translationLanguageExtension.getTranslationLanguage();
 
-                    this.updateParticipantTargetLanguage(identifier, language);
+                    if (participant.getSourceLanguage() != null &&
+                            !participant.getSourceLanguage().equals(language))
+                    {
+                        this.updateParticipantTargetLanguage(identifier, language);
+                    }
                 }
                 else
                 {
@@ -357,10 +369,8 @@ public class Transcriber
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": asked to set chatroom member of participant"
-                    + " with identifier " + identifier
-                    + " while it wasn't added before");
+            logger.warn("asked to set chatroom member of participant with identifier " + identifier
+                + " while it wasn't added before");
         }
     }
 
@@ -449,19 +459,29 @@ public class Transcriber
             }
 
             if (logger.isDebugEnabled())
-            {
-                logger.debug(
-                    getDebugName() + ": removed participant with identifier "
-                        + identifier);
-            }
+                logger.debug("removed participant with identifier " + identifier);
 
             return;
         }
 
-        logger.warn(
-            getDebugName() + ": participant with identifier "
-                + identifier +  " left while it did not exist");
+        logger.warn("participant with identifier " + identifier +  " left while it did not exist");
     }
+
+    /**
+     * Flush the audio buffer of a participant.
+     *
+     * @param identifier the identifier of the participant
+     */
+    public void flushParticipantAudioBuffer(String identifier)
+    {
+        Participant participant = getParticipant(identifier);
+        if (participant != null)
+        {
+            participant.flushBuffer();
+        }
+    }
+
+
 
     /**
      * Start transcribing all participants added to the list
@@ -471,9 +491,9 @@ public class Transcriber
         if (State.NOT_STARTED.equals(this.state))
         {
             if (logger.isDebugEnabled())
-                logger.debug(getDebugName() + ": transcriber is now transcribing");
+                logger.debug("transcriber is now transcribing");
 
-            updateDDClient(DD_ASPECT_START);
+            Statistics.incrementTotalTranscriberStarted();
 
             this.state = State.TRANSCRIBING;
             this.executorService = Executors.newSingleThreadExecutor();
@@ -487,9 +507,7 @@ public class Transcriber
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": trying to start Transcriber while it is"
-                    + " already started");
+            logger.warn("trying to start Transcriber while it is already started");
         }
     }
 
@@ -502,10 +520,7 @@ public class Transcriber
         if (State.TRANSCRIBING.equals(this.state))
         {
             if (logger.isDebugEnabled())
-                logger.debug(
-                    getDebugName() + ": transcriber is now finishing up");
-
-            updateDDClient(reason == null ? DD_ASPECT_STOP : DD_ASPECT_FAILED);
+                logger.debug("transcriber is now finishing up");
 
             this.state = reason == null ? State.FINISHING_UP : State.FINISHED;
             this.executorService.shutdown();
@@ -517,10 +532,14 @@ public class Transcriber
 
             if (reason == null)
             {
+                Statistics.incrementTotalTranscriberSopped();
+
                 checkIfFinishedUp();
             }
             else
             {
+                Statistics.incrementTotalTranscriberFailed();
+
                 for (TranscriptionListener listener : listeners)
                 {
                     listener.failed(reason);
@@ -529,27 +548,7 @@ public class Transcriber
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": trying to stop Transcriber while it is "
-                    + " already stopped");
-        }
-    }
-
-    /**
-     * Updated dd client with a stat.
-     *
-     * @param ddAspectStop
-     */
-    private void updateDDClient(String ddAspectStop)
-    {
-        StatsDClient dClient = JigasiBundleActivator.getDataDogClient();
-        if (dClient != null)
-        {
-            dClient.increment(ddAspectStop);
-            if (logger.isDebugEnabled())
-            {
-                logger.debug(getDebugName() + " thrown stat: " + ddAspectStop);
-            }
+            logger.warn("trying to stop Transcriber while it is already stopped");
         }
     }
 
@@ -567,9 +566,7 @@ public class Transcriber
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": trying to notify Transcriber for a while"
-                    + " it is already stopped");
+            logger.warn("trying to notify Transcriber for a while it is already stopped");
         }
     }
 
@@ -696,8 +693,9 @@ public class Transcriber
     {
         if (!isTranscribing())
         {
-            logger.trace(
-                getDebugName() + ": receiving audio while not transcribing");
+            if (logger.isTraceEnabled())
+                logger.trace("receiving audio while not transcribing");
+
             return;
         }
 
@@ -709,15 +707,15 @@ public class Transcriber
         {
             if (p.hasValidSourceLanguage())
             {
-                logger.trace(getDebugName() + ": gave audio to buffer");
+                if (logger.isTraceEnabled())
+                    logger.trace("gave audio to buffer");
+
                 p.giveBuffer(buffer);
             }
         }
         else
         {
-            logger.warn(
-                getDebugName() + ": reading from SSRC " + ssrc
-                    + " while it is not known as a participant");
+            logger.warn("reading from SSRC " + ssrc + " while it is not known as a participant");
         }
     }
 
@@ -766,10 +764,7 @@ public class Transcriber
      */
     public boolean isAnyParticipantRequestingTranscription()
     {
-
-        return getParticipants()
-            .stream()
-            .anyMatch(Participant::isRequestingTranscription);
+        return getParticipants().stream().anyMatch(Participant::isRequestingTranscription);
     }
 
     /**
@@ -796,7 +791,7 @@ public class Transcriber
      */
     public AudioMixerMediaDevice getMediaDevice()
     {
-        return this.mediaDevice;
+        return this.transcriptionService.getMediaDevice(this);
     }
 
     /**
@@ -813,16 +808,16 @@ public class Transcriber
                 {
                     if (!participant.isCompleted())
                     {
-                        logger.debug(
-                            participant.getDebugName()
-                                + " is still not finished");
+                        if (logger.isDebugEnabled())
+                            logger.debug("is still not finished");
+
                         return;
                     }
                 }
             }
 
             if (logger.isDebugEnabled())
-                logger.debug(getDebugName() + ": transcriber is now finished");
+                logger.debug("transcriber is now finished");
 
             this.state = State.FINISHED;
             for (TranscriptionListener listener : listeners)
@@ -838,6 +833,14 @@ public class Transcriber
     public TranscriptionService getTranscriptionService()
     {
         return transcriptionService;
+    }
+
+    /**
+     * @return the {@link TranslationManager}.
+     */
+    public TranslationManager getTranslationManager()
+    {
+        return this.translationManager;
     }
 
     /**
@@ -927,6 +930,17 @@ public class Transcriber
     private boolean shouldFilterSilence()
     {
         return JigasiBundleActivator.getConfigurationService()
-            .getBoolean(P_NAME_FILTER_SILENCE, FILTER_SILENCE_DEFAULT_VALUE);
+            .getBoolean(P_NAME_FILTER_SILENCE, FILTER_SILENCE_DEFAULT_VALUE)
+            && !this.transcriptionService.disableSilenceFilter();
+    }
+
+    /**
+     * Retrieves the current call context.
+     *
+     * @return the current CallContext instance associated with this object
+     */
+    public CallContext getCallContext()
+    {
+        return this.context;
     }
 }

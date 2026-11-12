@@ -17,18 +17,18 @@
  */
 package org.jitsi.jigasi;
 
-import com.timgroup.statsd.*;
+import net.java.sip.communicator.util.osgi.*;
 import org.jitsi.meet.*;
+import org.jitsi.utils.logging.Logger;
 import org.jitsi.xmpp.extensions.*;
 import org.jitsi.xmpp.extensions.jibri.*;
 import org.jitsi.xmpp.extensions.jitsimeet.*;
 import org.jitsi.xmpp.extensions.rayo.*;
-import net.java.sip.communicator.service.gui.*;
+import org.jitsi.xmpp.extensions.visitors.*;
+import org.jitsi.jigasi.xmpp.extensions.*;
 import net.java.sip.communicator.service.protocol.*;
-import net.java.sip.communicator.util.*;
 import org.jitsi.jigasi.health.*;
 import org.jitsi.jigasi.stats.*;
-import org.jitsi.jigasi.xmpp.*;
 import org.jitsi.service.configuration.*;
 import org.jivesoftware.smack.provider.*;
 import org.osgi.framework.*;
@@ -47,8 +47,8 @@ import java.util.*;
  * @author Nik Vaessen
  */
 public class JigasiBundleActivator
-    implements BundleActivator,
-               ServiceListener
+    extends DependentActivator
+    implements ServiceListener
 {
     /**
      * The logger
@@ -85,6 +85,11 @@ public class JigasiBundleActivator
      */
     public final static String P_NAME_ENABLE_SIP_STARTMUTED
         = "org.jitsi.jigasi.ENABLE_SIP_STARTMUTED";
+
+    /**
+     * The property name for the boolean value that enables or disables visitors for sip calls.
+     */
+    public final static String P_NAME_ENABLE_SIP_VISITORS = "org.jitsi.jigasi.ENABLE_SIP_VISITORS";
 
     /**
      * The default value for room join timeout.
@@ -129,7 +134,7 @@ public class JigasiBundleActivator
      */
     private static boolean shutdownInProgress;
 
-    private UIServiceStub uiServiceStub = new UIServiceStub();
+    private static ConfigurationService configService;
 
     /**
      * Returns <tt>ConfigurationService</tt> instance.
@@ -137,8 +142,7 @@ public class JigasiBundleActivator
      */
     public static ConfigurationService getConfigurationService()
     {
-        return ServiceUtils.getService(
-            osgiContext, ConfigurationService.class);
+        return configService;
     }
 
     /**
@@ -165,7 +169,7 @@ public class JigasiBundleActivator
     }
 
     /**
-     * Get wether starmuted is enabled over sip.
+     * Get whether starmuted is enabled over sip.
      *
      * @return true if startmuted is enabled, false, otherwise.
      */
@@ -176,32 +180,74 @@ public class JigasiBundleActivator
     }
 
     /**
-     * Returns a {@link StatsDClient} instance to push statistics to datadog
+     * Get whether visitors are enabled for sip.
      *
-     * @return the {@link StatsDClient}
+     * @return true if jigasi is enabled to join as visitor.
      */
-    public static StatsDClient getDataDogClient()
+    public static boolean isSipVisitorsEnabled()
     {
-        return ServiceUtils.getService(osgiContext, StatsDClient.class);
+        return JigasiBundleActivator.getConfigurationService().getBoolean(P_NAME_ENABLE_SIP_VISITORS, false);
+    }
+
+    public JigasiBundleActivator()
+    {
+        super(ConfigurationService.class);
     }
 
     @Override
-    public void start(final BundleContext bundleContext)
-        throws Exception
+    public void startWithServices(final BundleContext bundleContext)
     {
         osgiContext = bundleContext;
+        configService = getService(ConfigurationService.class);
 
-        bundleContext.registerService(UIService.class, uiServiceStub, null);
+        StartMutedProvider.registerStartMutedProvider();
+
+        new ConferenceIqProvider();
+
+        VisitorsIq.Companion.registerProviders();
+        ProviderManager.addExtensionProvider(
+                VisitorsPromotionResponseExtension.ELEMENT,
+                VisitorsIq.NAMESPACE,
+                new DefaultPacketExtensionProvider<>(VisitorsPromotionResponseExtension.class)
+        );
+
+        ProviderManager.addExtensionProvider(
+                FeaturesExtension.ELEMENT,
+                FeaturesExtension.NAMESPACE,
+                new DefaultPacketExtensionProvider<>(FeaturesExtension.class)
+        );
+        ProviderManager.addExtensionProvider(
+                FeatureExtension.ELEMENT,
+                FeatureExtension.NAMESPACE,
+                new DefaultPacketExtensionProvider<>(FeatureExtension.class)
+        );
 
         if (isSipEnabled())
         {
-            MuteIqProvider.registerMuteIqProvider();
+            if (isSipStartMutedEnabled())
+            {
+                ProviderManager.addIQProvider(
+                    MuteIq.ELEMENT,
+                    MuteIq.NAMESPACE,
+                    new MuteIqProvider());
+            }
 
             // recording status, to detect recording start/stop
             ProviderManager.addExtensionProvider(
-                RecordingStatus.ELEMENT_NAME,
+                RecordingStatus.ELEMENT,
                 RecordingStatus.NAMESPACE,
                 new DefaultPacketExtensionProvider<>(RecordingStatus.class)
+            );
+
+            ProviderManager.addExtensionProvider(
+                    ConferenceProperties.ELEMENT,
+                    ConferenceProperties.NAMESPACE,
+                    new DefaultPacketExtensionProvider<>(ConferenceProperties.class)
+            );
+            ProviderManager.addExtensionProvider(
+                    ConferenceProperties.ConferenceProperty.ELEMENT,
+                    ConferenceProperties.NAMESPACE,
+                    new DefaultPacketExtensionProvider<>(ConferenceProperties.ConferenceProperty.class)
             );
 
             logger.info("initialized SipGateway");
@@ -247,6 +293,12 @@ public class JigasiBundleActivator
 
         // Register Rayo IQs
         new RayoIqProvider().registerRayoIQs();
+
+        // Register the traceparent extension used for distributed tracing.
+        ProviderManager.addExtensionProvider(
+            TraceParent.ELEMENT,
+            TraceParent.NAMESPACE,
+            new TraceParentProvider());
 
         bundleContext.addServiceListener(this);
 
@@ -348,14 +400,7 @@ public class JigasiBundleActivator
         {
             gateways.forEach(AbstractGateway::stop);
 
-            // Note that there are two ShutdownService implementations. One in
-            // jitsi coming from the ui-service bundle, and one is jicoco. We
-            // only use the one in jicoco because the other one is essentially
-            // a no-op.
-            ShutdownService shutdownService
-                = ServiceUtils.getService(
-                    osgiContext,
-                    ShutdownService.class);
+            ShutdownService shutdownService = ServiceUtils.getService(osgiContext, ShutdownService.class);
 
             logger.info("Jigasi is shutting down NOW");
             shutdownService.beginShutdown();
@@ -364,7 +409,6 @@ public class JigasiBundleActivator
 
     /**
      * Returns the list of enabled gateways.
-     * @return
      */
     public static List<AbstractGateway> getAvailableGateways()
     {
